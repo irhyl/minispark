@@ -29,11 +29,13 @@ from minispark.physical.plan import (
     ExchangeExec,
     FilterExec,
     HashAggregateExec,
+    HashJoinExec,
     PhysicalPlan,
     ProjectExec,
     ScanExec,
     ShuffleReadExec,
     ShuffleWriteExec,
+    SortExec,
 )
 
 
@@ -63,10 +65,34 @@ def _split(plan: PhysicalPlan, stages: list[Stage]) -> tuple[PhysicalPlan, int]:
 
     if isinstance(plan, ExchangeExec):
         child_fragment, child_partitions = _split(plan.child, stages)
-        write_plan = ShuffleWriteExec(child_fragment, plan.num_partitions, plan.partition_exprs)
+        write_plan = ShuffleWriteExec(
+            child_fragment, plan.num_partitions, plan.partition_exprs, plan.range_boundaries
+        )
         stages.append(Stage(stage_id=len(stages), plan=write_plan, num_partitions=child_partitions))
-        read_plan = ShuffleReadExec(from_stage_id=len(stages) - 1, schema=plan.schema)
+        read_plan = ShuffleReadExec(
+            from_stage_id=len(stages) - 1, schema=plan.schema, is_broadcast=plan.is_broadcast
+        )
         return read_plan, plan.num_partitions
+
+    if isinstance(plan, HashJoinExec):
+        # Each side is split independently: either side may itself close
+        # off its own upstream stage(s) (an Exchange, whether a shuffle
+        # or a broadcast). The join stage's own partition count is the
+        # *left* side's post-split count. For a shuffle hash join that is
+        # the same number as the right side's (both were exchanged to the
+        # same shuffle_partitions), so it does not matter which side is
+        # picked; for a broadcast join, left is the large, unshuffled
+        # side (its original partition count) and right is the broadcast
+        # exchange (always 1 partition), and it is left's count, not 1,
+        # that must drive how many tasks this stage runs.
+        left_fragment, left_partitions = _split(plan.left, stages)
+        right_fragment, _right_partitions = _split(plan.right, stages)
+        if left_fragment is plan.left and right_fragment is plan.right:
+            return plan, left_partitions
+        new_plan = HashJoinExec(
+            left_fragment, right_fragment, plan.left_keys, plan.right_keys, plan.on, plan.schema
+        )
+        return new_plan, left_partitions
 
     if len(plan.children) == 1:
         original_child = plan.children[0]
@@ -95,6 +121,8 @@ def _with_child(plan: PhysicalPlan, new_child: PhysicalPlan) -> PhysicalPlan:
         return HashAggregateExec(
             new_child, plan.group_by, plan.aggregates, plan.schema, plan.is_partial
         )
+    if isinstance(plan, SortExec):
+        return SortExec(new_child, plan.sort_exprs, plan.ascending, plan.schema)
     raise NotImplementedError(
         f"Cannot rebuild physical node {type(plan).__name__} with a new child"
     )
