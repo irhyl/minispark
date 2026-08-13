@@ -86,3 +86,130 @@ class ProjectExec(PhysicalPlan):
     def node_label(self) -> str:
         cols = ", ".join(output_name(c) for c in self.columns)
         return f"ProjectExec[{cols}]"
+
+
+class HashAggregateExec(PhysicalPlan):
+    """Groups rows by `group_by` and applies `aggregates`.
+
+    The same node type is used for both the partial (pre-shuffle,
+    map-side) and final (post-shuffle, reduce-side) aggregation passes:
+    the grouping logic is identical either way (see
+    physical/operators.py); only the *input* differs (raw rows for
+    partial, upstream partial states for final) and whether
+    AggregateFunction.update() or .merge() combines rows into a group.
+    `is_partial` selects between them. `schema` is supplied by the
+    planner (physical/planner.py), not recomputed here, exactly like
+    ProjectExec: a partial aggregate's schema (group columns plus opaque
+    internal state columns) and a final aggregate's schema (group columns
+    plus named, typed aggregate outputs) are different enough that
+    deriving both here would duplicate what the planner already knows.
+    """
+
+    def __init__(
+        self,
+        child: PhysicalPlan,
+        group_by: list[Expression],
+        aggregates: list[Expression],
+        schema: Schema,
+        is_partial: bool,
+    ):
+        self.child = child
+        self.group_by = group_by
+        self.aggregates = aggregates
+        self._schema = schema
+        self.is_partial = is_partial
+
+    @property
+    def schema(self) -> Schema:
+        return self._schema
+
+    @property
+    def children(self) -> list[PhysicalPlan]:
+        return [self.child]
+
+    @property
+    def node_label(self) -> str:
+        kind = "partial" if self.is_partial else "final"
+        group_cols = ", ".join(output_name(g) for g in self.group_by)
+        agg_cols = ", ".join(output_name(a) for a in self.aggregates)
+        return f"HashAggregateExec[{kind}](groupBy=({group_cols}), aggregates=({agg_cols}))"
+
+
+class ExchangeExec(PhysicalPlan):
+    """Marks a shuffle boundary, as produced by the physical planner.
+
+    Never executed directly: `execution/stages.py`'s `build_stages()`
+    rewrites every `ExchangeExec` into a `ShuffleWriteExec` (ending the
+    upstream stage) and a `ShuffleReadExec` (starting the downstream
+    stage) before a plan ever reaches a Task. A bare `ExchangeExec`
+    reaching `physical/operators.py` means stage splitting was skipped or
+    is broken, not something a Task legitimately holds.
+    """
+
+    def __init__(
+        self, child: PhysicalPlan, num_partitions: int, partition_exprs: list[Expression]
+    ):
+        self.child = child
+        self.num_partitions = num_partitions
+        self.partition_exprs = partition_exprs
+
+    @property
+    def schema(self) -> Schema:
+        return self.child.schema
+
+    @property
+    def children(self) -> list[PhysicalPlan]:
+        return [self.child]
+
+    @property
+    def node_label(self) -> str:
+        keys = ", ".join(output_name(e) for e in self.partition_exprs)
+        return f"Exchange[hash({keys}), {self.num_partitions} partitions]"
+
+
+class ShuffleWriteExec(PhysicalPlan):
+    """Terminal node of a stage whose task output must be hash-partitioned
+    and written to shuffle storage (`shuffle/writer.py`) instead of
+    returned as this query's rows. Built by `execution/stages.py`'s
+    `build_stages()` from an `ExchangeExec`'s position in the plan, never
+    constructed by `physical/planner.py` directly.
+    """
+
+    def __init__(
+        self, child: PhysicalPlan, num_partitions: int, partition_exprs: list[Expression]
+    ):
+        self.child = child
+        self.num_partitions = num_partitions
+        self.partition_exprs = partition_exprs
+
+    @property
+    def schema(self) -> Schema:
+        return self.child.schema
+
+    @property
+    def children(self) -> list[PhysicalPlan]:
+        return [self.child]
+
+    @property
+    def node_label(self) -> str:
+        keys = ", ".join(output_name(e) for e in self.partition_exprs)
+        return f"ShuffleWriteExec[hash({keys}), {self.num_partitions} partitions]"
+
+
+class ShuffleReadExec(PhysicalPlan):
+    """Leaf node of a stage that reads a prior stage's shuffled output for
+    exactly one target partition, in place of a Scan reading from a
+    DataSource. Built by `execution/stages.py`'s `build_stages()`.
+    """
+
+    def __init__(self, from_stage_id: int, schema: Schema):
+        self.from_stage_id = from_stage_id
+        self._schema = schema
+
+    @property
+    def schema(self) -> Schema:
+        return self._schema
+
+    @property
+    def node_label(self) -> str:
+        return f"ShuffleReadExec[stage {self.from_stage_id}]"
