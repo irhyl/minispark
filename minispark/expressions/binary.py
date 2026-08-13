@@ -28,6 +28,10 @@ class BinaryExpression(Expression):
     def evaluate(self, record: Record) -> Any:
         return self.op(self.left.evaluate(record), self.right.evaluate(record))
 
+    @property
+    def children(self) -> list[Expression]:
+        return [self.left, self.right]
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.left!r}, {self.right!r})"
 
