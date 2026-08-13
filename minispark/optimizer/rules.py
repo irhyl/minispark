@@ -1,0 +1,304 @@
+"""Optimizer rules.
+
+Each rule is a pure function from LogicalPlan to LogicalPlan: it never
+mutates its input, it returns a new (possibly identical) tree. `Rule` is a
+thin ABC rather than a bare function so `Optimizer` can carry a `name` for
+logging/debugging and so later milestones can add rules with constructor
+state (e.g. a rule that needs access to `optimizer/statistics.py`) without
+changing the calling convention.
+
+Every rule here rewrites plan *shape* using only information already on the
+plan (schemas, expression trees). None of them consult table statistics;
+that is deliberate for Milestone 2. statistics.py exists for later
+milestones (join strategy selection) to use.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from collections.abc import Callable
+from typing import TypeGuard
+
+from minispark.expressions.base import Alias, Expression
+from minispark.expressions.binary import And, BinaryExpression, Or
+from minispark.expressions.column import Column
+from minispark.expressions.literal import Literal
+from minispark.expressions.predicates import IsNotNull, IsNull, Not
+from minispark.logical.analyzer import referenced_columns
+from minispark.logical.nodes import Filter, LogicalPlan, Project, Scan
+
+
+class Rule(ABC):
+    name: str = "Rule"
+
+    @abstractmethod
+    def apply(self, plan: LogicalPlan) -> LogicalPlan:
+        """Return a rewritten plan. May return `plan` itself if nothing changed."""
+
+
+def map_expressions(plan: LogicalPlan, fn: Callable[[Expression], Expression]) -> LogicalPlan:
+    """Rebuild `plan`, applying `fn` to every Filter condition and Project column.
+
+    Isinstance dispatch over the three Milestone 1/2 node types, matching
+    the style already used in execution/executor.py. A generic visitor
+    abstraction is not worth it yet for three node types; revisit once
+    Aggregate/Join/Sort land and the branch count grows.
+    """
+    if isinstance(plan, Scan):
+        return plan
+    if isinstance(plan, Filter):
+        return Filter(map_expressions(plan.child, fn), fn(plan.condition))
+    if isinstance(plan, Project):
+        return Project(map_expressions(plan.child, fn), [fn(c) for c in plan.columns])
+    raise NotImplementedError(f"map_expressions has no rule for logical node {type(plan).__name__}")
+
+
+# ---- constant folding ------------------------------------------------------
+
+
+def _fold(expr: Expression) -> Expression:
+    if isinstance(expr, BinaryExpression):
+        left = _fold(expr.left)
+        right = _fold(expr.right)
+        if isinstance(left, Literal) and isinstance(right, Literal):
+            return Literal(type(expr).op(left.value, right.value))
+        return type(expr)(left, right)
+    if isinstance(expr, Alias):
+        return Alias(_fold(expr.child), expr.name)
+    if isinstance(expr, Not):
+        child = _fold(expr.child)
+        if isinstance(child, Literal):
+            return Literal(not bool(child.value))
+        return Not(child)
+    if isinstance(expr, (IsNull, IsNotNull)):
+        child = _fold(expr.child)
+        if isinstance(child, Literal):
+            is_null = child.value is None
+            return Literal(is_null if isinstance(expr, IsNull) else not is_null)
+        return type(expr)(child)
+    return expr
+
+
+class ConstantFolding(Rule):
+    """Evaluate sub-expressions made entirely of literals at plan time.
+
+    `age > 10 + 10` becomes `age > 20`: `10 + 10` has no Column reference,
+    so it can be evaluated once here instead of once per row at execution.
+    """
+
+    name = "ConstantFolding"
+
+    def apply(self, plan: LogicalPlan) -> LogicalPlan:
+        return map_expressions(plan, _fold)
+
+
+# ---- filter simplification --------------------------------------------------
+
+
+def _simplify_bool(expr: Expression) -> Expression:
+    if isinstance(expr, And):
+        left = _simplify_bool(expr.left)
+        right = _simplify_bool(expr.right)
+        if isinstance(left, Literal):
+            return right if left.value else Literal(False)
+        if isinstance(right, Literal):
+            return left if right.value else Literal(False)
+        return And(left, right)
+    if isinstance(expr, Or):
+        left = _simplify_bool(expr.left)
+        right = _simplify_bool(expr.right)
+        if isinstance(left, Literal):
+            return Literal(True) if left.value else right
+        if isinstance(right, Literal):
+            return Literal(True) if right.value else left
+        return Or(left, right)
+    if isinstance(expr, Not):
+        child = _simplify_bool(expr.child)
+        if isinstance(child, Not):
+            return child.child
+        return Not(child)
+    if isinstance(expr, BinaryExpression):
+        return type(expr)(_simplify_bool(expr.left), _simplify_bool(expr.right))
+    if isinstance(expr, Alias):
+        return Alias(_simplify_bool(expr.child), expr.name)
+    return expr
+
+
+class FilterSimplification(Rule):
+    """Simplify boolean expressions: `x AND True` -> `x`, `Not(Not(x))` -> `x`, etc.
+
+    Runs after ConstantFolding so conditions like `x > 10 AND (1 == 1)`
+    have already had `1 == 1` folded to `Literal(True)` by the time this
+    rule sees them. Only simplifies the expression tree in place; it does
+    not remove a Filter node even when its condition folds down to
+    `Literal(True)` or `Literal(False)` (that would need a dedicated
+    "always true / always false" plan rewrite, which is not implemented
+    here to avoid introducing a new plan node just for this case).
+    """
+
+    name = "FilterSimplification"
+
+    def apply(self, plan: LogicalPlan) -> LogicalPlan:
+        return map_expressions(plan, _simplify_bool)
+
+
+# ---- predicate pushdown -----------------------------------------------------
+
+
+class PredicatePushdown(Rule):
+    """Push a Filter below a Project when the filter does not need the Project.
+
+    `df.select("name", "age").filter(col("age") > 18)` builds
+    `Filter(Project(Scan, [name, age]), age > 18)`. Filtering after
+    projecting means every row is projected before most of them get
+    thrown away. This rule swaps the two when every column the filter
+    needs is already present on the Project's child, producing
+    `Project(Filter(Scan, age > 18), [name, age])` instead: rows are
+    dropped before the (comparatively cheap, here) projection work runs.
+
+    There is no Join node yet (Milestone 4/5), so this cannot yet push a
+    filter through a join to a specific side, which is the textbook
+    predicate-pushdown example. Pushing a Filter below a Project is the
+    meaningful instance of the same idea available with today's node set.
+    """
+
+    name = "PredicatePushdown"
+
+    def apply(self, plan: LogicalPlan) -> LogicalPlan:
+        return _pushdown(plan)
+
+
+def _pushdown(plan: LogicalPlan) -> LogicalPlan:
+    if isinstance(plan, Scan):
+        return plan
+    if isinstance(plan, Project):
+        return Project(_pushdown(plan.child), plan.columns)
+    if isinstance(plan, Filter):
+        new_child = _pushdown(plan.child)
+        if isinstance(new_child, Project):
+            needed = referenced_columns(plan.condition)
+            available = set(new_child.child.schema.field_names())
+            if needed <= available:
+                return Project(Filter(new_child.child, plan.condition), new_child.columns)
+        return Filter(new_child, plan.condition)
+    raise NotImplementedError(
+        f"PredicatePushdown has no rule for logical node {type(plan).__name__}"
+    )
+
+
+# ---- projection pruning -----------------------------------------------------
+
+
+class ProjectionPruning(Rule):
+    """Insert a minimal Project directly above Scan, keeping only referenced columns.
+
+    Computes, top-down, the set of columns actually needed by everything
+    above a given point in the plan (final Project output plus every
+    Filter condition in between) and, if the Scan's schema is wider than
+    that, wraps it in a Column-only Project.
+
+    Honesty check on what this buys: CSVDataSource.read() (storage/csv.py)
+    parses every column of every row regardless of what is requested. This
+    rule reduces the width of the Record dicts flowing through Filter and
+    Project below it (less per-row work, less memory per row in transit)
+    but does not reduce bytes read from disk. True source-level pruning
+    (skip parsing unrequested CSV columns, or Parquet column-level reads)
+    is out of scope until the physical/storage layers can honor a
+    "requested columns" hint, which is not implemented yet.
+    """
+
+    name = "ProjectionPruning"
+
+    def apply(self, plan: LogicalPlan) -> LogicalPlan:
+        return _prune(plan, needed=None)
+
+
+def _prune(plan: LogicalPlan, needed: set[str] | None) -> LogicalPlan:
+    if isinstance(plan, Scan):
+        schema_cols = plan.schema.field_names()
+        if needed is not None and set(schema_cols) - needed:
+            keep = [c for c in schema_cols if c in needed]
+            if keep and len(keep) < len(schema_cols):
+                return Project(plan, [Column(c) for c in keep])
+        return plan
+    if isinstance(plan, Filter):
+        # `needed=None` means "no Project above has restricted the output
+        # columns yet", i.e. every column reaching this point is still
+        # needed. A Filter does not narrow that on its own (it does not
+        # change which columns exist, only which rows survive) -- it only
+        # *adds* its own condition's columns to whatever was already
+        # required. Folding `needed=None` down to just `cond_cols` here
+        # would wrongly drop every column the filter's own condition does
+        # not reference, even when nothing above ever asked for that.
+        cond_cols = referenced_columns(plan.condition)
+        child_needed = None if needed is None else (needed | cond_cols)
+        return Filter(_prune(plan.child, child_needed), plan.condition)
+    if isinstance(plan, Project):
+        proj_cols: set[str] = set()
+        for expr in plan.columns:
+            proj_cols |= referenced_columns(expr)
+        return Project(_prune(plan.child, proj_cols), plan.columns)
+    raise NotImplementedError(
+        f"ProjectionPruning has no rule for logical node {type(plan).__name__}"
+    )
+
+
+# ---- redundant projection elimination ---------------------------------------
+
+
+def _is_plain_column_projection(node: LogicalPlan) -> TypeGuard[Project]:
+    """True if `node` is a Project whose columns are all plain Column refs.
+
+    Typed as a TypeGuard (not just `-> bool`) so `if _is_plain_column_
+    projection(new_child):` narrows `new_child` to `Project` for the type
+    checker, letting `new_child.child` below type-check without a cast.
+    """
+    return isinstance(node, Project) and all(isinstance(c, Column) for c in node.columns)
+
+
+class RedundantProjectionElimination(Rule):
+    """Remove Project nodes that do no real work.
+
+    Two cases:
+
+    1. Identity projection: a Project whose columns are plain Column
+       references, in the same order as its child's schema, is a no-op
+       and is replaced by its child directly.
+    2. Collapsing a plain-Column Project directly below another Project:
+       if the child only renames-nothing/selects a subset of columns
+       (no Alias, no computed expression), the parent Project's
+       expressions can reference the grandchild's schema directly, since
+       the values passed through are unchanged. This is the common case
+       ProjectionPruning produces (a plain-Column pruning Project inserted
+       next to the user's own select()).
+
+    General Project-of-Project fusion (folding an Alias or a computed
+    expression from the inner Project into the outer one, e.g. rewriting
+    references to a computed column) is not implemented: it needs
+    expression substitution, which is more machinery than today's node
+    set justifies.
+    """
+
+    name = "RedundantProjectionElimination"
+
+    def apply(self, plan: LogicalPlan) -> LogicalPlan:
+        return _eliminate(plan)
+
+
+def _eliminate(plan: LogicalPlan) -> LogicalPlan:
+    if isinstance(plan, Scan):
+        return plan
+    if isinstance(plan, Filter):
+        return Filter(_eliminate(plan.child), plan.condition)
+    if isinstance(plan, Project):
+        new_child = _eliminate(plan.child)
+        if _is_plain_column_projection(plan):
+            column_names = [c.name for c in plan.columns if isinstance(c, Column)]
+            if column_names == new_child.schema.field_names():
+                return new_child
+        if _is_plain_column_projection(new_child):
+            return Project(new_child.child, plan.columns)
+        return Project(new_child, plan.columns)
+    raise NotImplementedError(
+        f"RedundantProjectionElimination has no rule for logical node {type(plan).__name__}"
+    )
