@@ -8,6 +8,7 @@ benefit to be had from a lazier partition factory here.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable, Iterator
 
 from minispark.core.dataset import Dataset
@@ -67,4 +68,14 @@ class MemoryDataSource(DataSource):
 
 
 def _make_records_fn(rows: list[Record]) -> Callable[[], Iterator[Record]]:
-    return lambda: iter(rows)
+    """`functools.partial(iter, rows)` rather than `lambda: iter(rows)`.
+
+    A lambda is not picklable by the standard library `pickle` module
+    (used by `multiprocessing`) no matter what it closes over. A
+    `functools.partial` wrapping a picklable callable (`iter`, a builtin)
+    and picklable arguments (`rows`, a list of plain dicts) is picklable.
+    This is what lets a Dataset built by MemoryDataSource be sent whole to
+    a worker process (Milestone 3) without changing Partition's public
+    `records_fn: Callable[[], Iterator[Record]]` contract at all.
+    """
+    return functools.partial(iter, rows)
