@@ -1,10 +1,11 @@
 # Shuffle
 
-How `group_by(...).agg(...)` moves data between partitions, as of
-Milestone 4. See `docs/execution-model.md` for narrow vs wide
-dependencies and how a wide dependency becomes a stage boundary in
-general; this document is specifically about what happens at that
-boundary.
+How `group_by(...).agg(...)`, `join(...)`, and `order_by(...)` move data
+between partitions, as of Milestone 5. See `docs/execution-model.md` for
+narrow vs wide dependencies and how a wide dependency becomes a stage
+boundary in general; this document is specifically about what happens at
+that boundary, and how the three operators above differ in what they
+shuffle and why.
 
 ## Why a shuffle is needed at all
 
@@ -47,9 +48,114 @@ splitting one group's rows across two target partitions. A stable hash
 `tests/unit/test_partitioner.py` by literally spawning a second Python
 process and checking it computes the same answer.
 
-`RangePartitioner` also exists (the build spec asks for it explicitly)
-but has no consumer yet: it is the right partitioner for a total-order
-sort, which is Milestone 5's `Sort`, not this milestone's `group_by`.
+`RangePartitioner` (unused as of Milestone 4) is what `order_by()` uses
+as of Milestone 5: see "Sort: range partitioning" below for how its
+boundaries are chosen and why negation, not a different partitioner,
+is what makes a descending sort work.
+
+## Join: two shuffles in, one join stage out
+
+`left.join(right, on="id")` (the default, no `broadcast=True` hint) is a
+shuffle hash join: both `left` and `right` get their own `ExchangeExec`,
+hash-partitioned by `on`'s columns, into the *same* `shuffle_partitions`
+target count. Because `HashPartitioner` is a pure function of the key
+value, not of which side produced it, a row from `left` and a row from
+`right` with equal join keys are guaranteed to land in the same target
+partition, from two different upstream stages. `execution/stages.py`'s
+`build_stages()` turns this into three stages: two shuffle-write stages
+(one per side) and one join stage, whose `HashJoinExec` reads from both
+via two `ShuffleReadExec` leaves (see "Reading from more than one prior
+stage" below). The per-partition join itself (build a hash table on
+`left`'s rows, probe with `right`'s, `physical/operators.py`) needs no
+data movement of its own; both inputs already arrived shuffled.
+
+`left.join(right, on="id", broadcast=True)` skips the shuffle for `left`
+entirely. Only `right` gets an `ExchangeExec`, with `num_partitions=1`
+and `is_broadcast=True`: every row goes to the single target partition
+regardless of key (`HashPartitioner(1)` sends everything to partition 0
+anyway, so no special partitioner is needed for this, just the
+`num_partitions=1` choice). `execution/scheduler.py` is what actually
+makes this a *broadcast*: when building tasks for a stage that reads a
+broadcast exchange, every task requests target partition 0, the same
+blocks, regardless of its own `partition_id` (see
+`shuffle/manager.py`'s `ShuffleManager.blocks_for()`). `left` is left
+completely unshuffled, so the join stage runs with `left`'s original
+partition count, not 1.
+
+Choosing broadcast is an explicit hint, not automatic: see
+`logical/nodes.py`'s `Join` docstring for why (no persistent catalog, no
+reliable byte-size estimate without scanning data).
+
+## Reading from more than one prior stage
+
+A `HashJoinExec`-rooted stage's plan has two `ShuffleReadExec` leaves
+(`physical/plan.py`'s `leaves()` walks both). `execution/tasks.py`'s
+`Task.shuffle_blocks` is therefore keyed by source `stage_id`
+(`dict[int, list[ShuffleBlockMeta]]`), not a single flat list: each
+`ShuffleReadExec` looks up only its own stage's entry
+(`physical/operators.py`'s `_execute_shuffle_read_partition`).
+`execution/scheduler.py` builds this dict per task by finding every
+read leaf in the stage's plan and resolving each one's blocks
+independently, honoring `is_broadcast` per leaf.
+
+## Sort: range partitioning
+
+`order_by("age")` needs every row globally ordered by `age`, not just
+grouped by it: rows are hash-partitioned by *equality* for a join or a
+group-by, they need to be range-partitioned by *order* for a sort, so
+that partition 0 holds the smallest keys, partition 1 the next range up,
+and so on, and simply reading partitions back in order (which the
+scheduler always does) produces a fully sorted result. This is what
+`shuffle/partitioner.py`'s `RangePartitioner` does: `bisect_right` on a
+list of `num_partitions - 1` boundary values.
+
+Two things this needs that a hash-partitioned shuffle does not:
+
+* **Where to put the boundaries.** `RangePartitioner` needs them handed
+  in, computed from the actual data; there is no distributed sampling
+  stage to compute them from a sample without touching data before the
+  main shuffle runs. `physical/planner.py`'s `_sort_range_boundaries()`
+  gets them the direct way: it eagerly executes the child plan
+  (`physical/operators.py`'s whole-Dataset `execute()`, so only a
+  Scan/Filter/Project child chain works, not one ending in `Aggregate`
+  or `Join`) and computes the sort key's exact min/max with
+  `optimizer/statistics.py`'s `compute_statistics()`, then splits that
+  range into `shuffle_partitions` equal-*width* buckets. This is a real,
+  deliberate exception to "a plan is built without touching data," flagged
+  loudly in both code and `docs/query-planning.md`, not hidden. Equal-width
+  (not equal-row-count) bucketing also means skewed data can still produce
+  uneven partition sizes; a real sampling-based partitioner would draw
+  boundaries from the data's actual distribution instead.
+* **Non-numeric and single-partition fallback.** Equal-width bucketing
+  needs subtraction and division, which do not mean anything for a string
+  (or other non-numeric) sort key. Sorting by such a column, or requesting
+  only one shuffle partition, falls back to `range_boundaries=None`
+  (`shuffle/writer.py`'s `HashPartitioner(1)` then handles it, since with
+  one target partition hash vs range partitioning cannot differ): still
+  fully correct, since there is nothing to be out of range relative to
+  with only one partition, just not parallel.
+* **Descending order.** `RangePartitioner` always assigns *ascending*
+  target partitions, and the scheduler always merges partitions back in
+  id order; for a descending sort that combination would put the
+  smallest-keyed partition (itself sorted descending internally) first, a
+  locally correct but globally wrong result. `_sort_range_boundaries()`
+  fixes this by negating the partitioning key (`-value`, via a synthetic
+  `Multiply(primary_key, Literal(-1))` expression) and the boundaries
+  computed from the negated range, rather than teaching `RangePartitioner`
+  or the scheduler anything about sort direction. Verified in
+  `tests/unit/test_sort_physical_plan.py` and with a real-multiprocessing
+  regression test in `tests/integration/test_sort_e2e.py`, this exact bug
+  (descending sort producing a blockwise-ascending, not globally
+  descending, result) was caught and fixed during development.
+
+The multi-key case (`order_by("age", "name")`) only partitions by the
+*first* key: the local sort (both before and after the shuffle,
+`physical/plan.py`'s `SortExec`, used identically for the pre-shuffle
+local sort and the final post-shuffle sort, matching `HashAggregateExec`'s
+partial/final reuse pattern) still fully respects every key and its own
+direction, via repeated stable sorts, last key first. Nulls always sort
+last, regardless of ascending/descending, a documented simplification
+rather than per-column `NULLS FIRST`/`NULLS LAST` placement.
 
 ## On-disk block format
 
@@ -95,9 +201,11 @@ directory (a fresh `tempfile.mkdtemp()` per query, removed in a
 stage's tasks report their blocks, answers "which blocks does target
 partition P of stage S need to read." This bookkeeping lives only in the
 driver process's memory: a worker process does not share memory with the
-driver, so a reduce task is handed the exact, already-filtered block list
-it needs as plain data on its `Task` (`execution/tasks.py`'s
-`shuffle_blocks` field), not a reference to a live `ShuffleManager`.
+driver, so a reduce task is handed the exact, already-filtered block
+list(s) it needs as plain data on its `Task` (`execution/tasks.py`'s
+`shuffle_blocks: dict[stage_id, list[ShuffleBlockMeta]]` field, one entry
+per upstream stage it reads from), not a reference to a live
+`ShuffleManager`.
 
 ## How this fits into stages and tasks
 
