@@ -10,6 +10,7 @@ one of these only when an action runs.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Iterator
 
 from minispark.core.partition import Partition, PartitionMetadata
@@ -48,14 +49,15 @@ class Dataset:
         for i, record in enumerate(self.iter_records()):
             buckets[i % n].append(record)
 
-        def make_records_fn(rows: list[Record]):
-            return lambda: iter(rows)
-
+        # functools.partial(iter, rows), not `lambda: iter(rows)`: a lambda
+        # is not picklable by the standard library `pickle` module (used by
+        # `multiprocessing`) regardless of what it closes over. See
+        # storage/memory.py's `_make_records_fn` for the same fix.
         new_partitions = [
             Partition(
                 partition_id=i,
                 schema=self.schema,
-                records_fn=make_records_fn(rows),
+                records_fn=functools.partial(iter, rows),
                 metadata=PartitionMetadata(row_count=len(rows)),
             )
             for i, rows in enumerate(buckets)
