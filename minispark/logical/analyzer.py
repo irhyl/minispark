@@ -3,16 +3,14 @@
 Milestone 1 had no analyzer, so a bad column name surfaced late, as a plain
 Python KeyError, only once collect()/show()/count() actually evaluated a
 Column against a row (see the note in expressions/column.py). This module
-closes that gap for the plan shapes that exist so far (Scan, Filter,
-Project, Aggregate): every Column referenced anywhere in the plan is
-checked against its child's schema up front, so `df.select("does_not_exist")`
-fails with a clear AnalysisException as soon as an action runs, before any
-row is read.
+closes that gap for every plan shape that exists: every Column referenced
+anywhere in the plan is checked against its child's schema up front, so
+`df.select("does_not_exist")` fails with a clear AnalysisException as soon
+as an action runs, before any row is read.
 
 What this analyzer does not do yet: type checking beyond "does this column
 exist" (arithmetic expressions still default to STRING in
-logical/nodes.py's `_output_field`, there is no type-inference engine), and
-join validation (Join does not exist until Milestone 5).
+logical/nodes.py's `_output_field`, there is no type-inference engine).
 """
 
 from __future__ import annotations
@@ -21,7 +19,16 @@ from minispark.core.schema import Schema
 from minispark.expressions.aggregate import AggregateFunction
 from minispark.expressions.base import Alias, Expression
 from minispark.expressions.column import Column
-from minispark.logical.nodes import Aggregate, Filter, LogicalPlan, Project, Scan, output_name
+from minispark.logical.nodes import (
+    Aggregate,
+    Filter,
+    Join,
+    LogicalPlan,
+    Project,
+    Scan,
+    Sort,
+    output_name,
+)
 
 
 class AnalysisException(Exception):
@@ -48,6 +55,10 @@ def analyze(plan: LogicalPlan) -> LogicalPlan:
         _analyze_project(plan)
     elif isinstance(plan, Aggregate):
         _analyze_aggregate(plan)
+    elif isinstance(plan, Join):
+        _analyze_join(plan)
+    elif isinstance(plan, Sort):
+        _analyze_sort(plan)
     else:
         raise NotImplementedError(f"Analyzer has no rule for logical node {type(plan).__name__}")
 
@@ -81,6 +92,49 @@ def _analyze_aggregate(plan: Aggregate) -> None:
         if inner.child is not None:
             _check_columns_exist(inner.child, plan.child.schema, context=f"agg({agg_expr!r})")
         _reject_duplicate_name(output_name(agg_expr), seen_names, context="group_by()/agg()")
+
+
+_SUPPORTED_JOIN_TYPES = {"inner"}
+
+
+def _analyze_join(plan: Join) -> None:
+    if plan.how not in _SUPPORTED_JOIN_TYPES:
+        raise AnalysisException(
+            f"Unsupported join type {plan.how!r}; only {sorted(_SUPPORTED_JOIN_TYPES)} "
+            "are implemented (left/right/full outer and semi/anti joins are not)."
+        )
+    if not plan.on:
+        raise AnalysisException("join() requires at least one column in on=")
+
+    left_schema = plan.left.schema
+    right_schema = plan.right.schema
+    for name in plan.on:
+        if not left_schema.has_field(name):
+            raise AnalysisException(
+                f"Join column '{name}' not found on the left side. "
+                f"Available columns: {left_schema.field_names()}"
+            )
+        if not right_schema.has_field(name):
+            raise AnalysisException(
+                f"Join column '{name}' not found on the right side. "
+                f"Available columns: {right_schema.field_names()}"
+            )
+
+    on_set = set(plan.on)
+    colliding = (set(left_schema.field_names()) & set(right_schema.field_names())) - on_set
+    if colliding:
+        raise AnalysisException(
+            f"Column(s) {sorted(colliding)} exist on both sides of the join and are not "
+            "in on=; rename or select() them on one side before joining "
+            "(differently-named join keys via left_on/right_on are not supported)."
+        )
+
+
+def _analyze_sort(plan: Sort) -> None:
+    for expr in plan.sort_exprs:
+        if not isinstance(expr, Column):
+            raise AnalysisException(f"order_by() only accepts column names, got {expr!r}")
+        _check_columns_exist(expr, plan.child.schema, context=f"order_by({expr!r})")
 
 
 def _reject_duplicate_name(name: str, seen_names: set[str], context: str) -> None:
