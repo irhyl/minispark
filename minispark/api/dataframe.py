@@ -2,10 +2,14 @@
 
 `filter()`/`select()` only build logical plan nodes — see `logical/nodes.py`
 — and never touch data. Only the action methods at the bottom of this file
-(`collect`, `show`, `count`, `explain`) trigger execution, currently via
-the naive tree-walking executor (`execution/executor.py`); Milestone 2/3
-will retarget these actions at an optimizer + physical plan + DAG/scheduler
-without changing this class's public surface.
+(`collect`, `show`, `count`, `explain`) trigger anything: analysis
+(`logical/analyzer.py`), optimization (`optimizer/optimizer.py`), physical
+planning (`physical/planner.py`), and physical execution
+(`physical/operators.py`), in that order. Milestone 1's naive executor
+(`execution/executor.py`) is no longer on this path; it remains as the
+correctness oracle physical execution is tested against. Milestone 3 will
+retarget the last step at a DAG/scheduler without changing this class's
+public surface.
 """
 
 from __future__ import annotations
@@ -14,11 +18,14 @@ from typing import TYPE_CHECKING
 
 from minispark.core.record import Record
 from minispark.core.schema import Schema
-from minispark.execution.executor import execute
 from minispark.expressions.base import Expression
 from minispark.expressions.column import Column
+from minispark.logical.analyzer import analyze
 from minispark.logical.nodes import Filter, LogicalPlan, Project
 from minispark.logical.plan import explain_string
+from minispark.optimizer.optimizer import Optimizer, default_rules
+from minispark.physical import operators as physical_operators
+from minispark.physical.planner import plan_physical
 
 if TYPE_CHECKING:
     from minispark.api.session import MiniSparkSession
@@ -50,13 +57,20 @@ class DataFrame:
         exprs = [Column(c) if isinstance(c, str) else c for c in columns]
         return DataFrame(self._session, Project(self._plan, exprs))
 
-    # ---- actions (trigger execution) ---------------------------------------
+    # ---- actions (trigger analysis, optimization, and execution) ----------
+    def _optimized_plan(self) -> LogicalPlan:
+        analyzed = analyze(self._plan)
+        optimizer = Optimizer(default_rules(self._session.config.optimizer))
+        return optimizer.optimize(analyzed)
+
     def collect(self) -> list[Record]:
-        dataset = execute(self._plan)
+        physical = plan_physical(self._optimized_plan())
+        dataset = physical_operators.execute(physical)
         return list(dataset.iter_records())
 
     def count(self) -> int:
-        dataset = execute(self._plan)
+        physical = plan_physical(self._optimized_plan())
+        dataset = physical_operators.execute(physical)
         return dataset.row_count()
 
     def show(self, n: int = 20) -> None:
@@ -76,6 +90,20 @@ class DataFrame:
             cells = (str(r.get(c, "")).ljust(w) for c, w in zip(columns, widths, strict=True))
             print(" | ".join(cells))
 
-    def explain(self) -> None:
-        print("== Logical Plan ==")
-        print(explain_string(self._plan))
+    def explain(self, optimized: bool = False) -> None:
+        if not optimized:
+            print("== Logical Plan ==")
+            print(explain_string(self._plan))
+            return
+        analyzed = analyze(self._plan)
+        print("== Analyzed Logical Plan ==")
+        print(explain_string(analyzed))
+        optimizer = Optimizer(default_rules(self._session.config.optimizer))
+        optimized_plan = optimizer.optimize(analyzed)
+        print()
+        print("== Optimized Logical Plan ==")
+        print(explain_string(optimized_plan))
+        physical = plan_physical(optimized_plan)
+        print()
+        print("== Physical Plan ==")
+        print(explain_string(physical))
