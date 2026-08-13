@@ -22,35 +22,38 @@ Query Optimizer
    |
 Physical Plan
    |
-DAG Builder               <- not yet implemented (Milestone 3)
+DAG Builder
    |
-Stage Planner              <- not yet implemented (Milestone 3)
+Stage Planner
    |
-Scheduler                  <- not yet implemented (Milestone 3)
+Scheduler
    |
-Task Execution              <- not yet implemented (Milestone 3)
+Task Execution
    |
-Storage / Shuffle
+Storage / Shuffle          <- Shuffle not yet implemented (Milestone 4)
 ```
 
-**Milestone 2 status**: everything above "DAG Builder" is implemented.
-`DataFrame` actions (`collect`/`show`/`count`/`explain`) now run, in order:
+**Milestone 3 status**: everything above "Storage / Shuffle" is
+implemented, except the shuffle half of the bottom layer. `DataFrame`
+actions (`collect`/`show`/`count`/`explain`) now run, in order:
 `logical/analyzer.py` (validates the plan), `optimizer/optimizer.py`
 (rewrites it), `physical/planner.py` (translates it to a physical plan),
-`physical/operators.py` (executes it). There is still no DAG, stage
-planner, scheduler, or task abstraction; all of the above runs in one
-process, one node at a time, exactly like Milestone 1 did. What changed is
-*what* runs (an optimized physical plan, not the raw logical plan) and
-*through how many stages* it passes before rows come out, not the fact
-that it is still a single-process tree walk.
+`execution/stages.py` (splits it into stages; today always exactly one,
+see `docs/execution-model.md`), `execution/scheduler.py`'s
+`LocalScheduler` (turns the stage into `Task`s and runs them, either
+sequentially or across a real `ProcessPoolExecutor` depending on
+`local[N]`). See `docs/execution-model.md` for the full DAG/Stage/Task/
+Worker/Scheduler picture; this file stays focused on package layout and
+design decisions.
 
-`minispark/execution/executor.py`, Milestone 1's naive, single-process,
-tree-walking interpreter of the *logical* plan, is no longer on the
-`DataFrame` action path. It is retained as the correctness oracle:
-`tests/unit/test_physical_plan.py` and `tests/unit/test_optimizer.py`
-assert that physical execution and post-optimization execution produce the
-same rows the naive executor would produce on the equivalent unoptimized
-plan. See `minispark/execution/executor.py`'s module docstring.
+`minispark/execution/executor.py` (Milestone 1's naive, single-process,
+logical-plan interpreter) and `physical/operators.py`'s whole-Dataset
+`execute()` (Milestone 2) are both no longer on the `DataFrame` action
+path. Both are retained as correctness oracles: `tests/unit/
+test_physical_plan.py`, `tests/unit/test_optimizer.py`, and
+`tests/unit/test_worker.py` assert that later, more complex execution
+paths produce the same rows a simpler earlier one would, on the
+equivalent unoptimized plan.
 
 ## Package layout and why each package exists
 
@@ -95,16 +98,16 @@ plan. See `minispark/execution/executor.py`'s module docstring.
   on `physical/` or `execution/`: an optimizer rule rewrites plan shape, it
   never touches a Dataset or a Partition.
 
-- **`minispark/physical/`** (Milestone 2): `plan.py` (`ScanExec`,
-  `FilterExec`, `ProjectExec`, one physical node per logical node type),
-  `planner.py` (`plan_physical()`, a 1:1 structural translation today),
-  `operators.py` (`execute()`, which walks a `PhysicalPlan` into a
-  `Dataset`, and currently duplicates `execution/executor.py`'s logic
-  exactly, because there is only one execution strategy per node so far).
-  This package is the seam Milestone 4/5 use to make a real choice
-  (HashAggregate vs SortAggregate, HashJoin vs BroadcastJoin) instead of a
-  1:1 copy; it exists now, ahead of that being interesting, so the seam
-  does not have to be retrofitted later.
+- **`minispark/physical/`**: `plan.py` (`ScanExec`, `FilterExec`,
+  `ProjectExec`, one physical node per logical node type), `planner.py`
+  (`plan_physical()`, a 1:1 structural translation today), `operators.py`
+  (Milestone 2's `execute()`, which walks a whole `PhysicalPlan` into a
+  `Dataset` and is now an oracle only; Milestone 3's `execute_partition()`,
+  which does the same walk for exactly one partition and is what a Task
+  actually runs). This package is the seam Milestone 4/5 use to make a
+  real choice (HashAggregate vs SortAggregate, HashJoin vs BroadcastJoin)
+  instead of a 1:1 copy; it exists now, ahead of that being interesting,
+  so the seam does not have to be retrofitted later.
 
 - **`minispark/storage/`** — `DataSource` (abstract), `MemoryDataSource`,
   `CSVDataSource`. Depends only on `core/`. A `Scan` logical node holds an
@@ -112,12 +115,12 @@ plan. See `minispark/execution/executor.py`'s module docstring.
   logical-plan layer never imports the storage layer's I/O code, only the
   data model it produces.
 
-- **`minispark/execution/`** — `executor.py`'s `NaiveExecutor`-equivalent
-  (a module-level `execute()` function, not a class, there is no state to
-  hold yet). As of Milestone 2 this is no longer called by `DataFrame`
-  (see the Milestone-2-status note above); it is kept as the correctness
-  oracle physical execution is tested against. This package's contents are
-  still expected to change shape substantially in Milestone 3.
+- **`minispark/execution/`**: `executor.py` (Milestone 1's naive
+  logical-plan interpreter, kept only as a correctness oracle) plus, as of
+  Milestone 3, `dag.py`, `stages.py`, `tasks.py`, `worker.py`, and
+  `scheduler.py`. See `docs/execution-model.md` for what each of these
+  does and how they fit together; that document, not this one, is the
+  place to look for the full DAG/Stage/Task/Worker/Scheduler picture.
 
 - **`minispark/api/`** — `DataFrame` (lazy; `filter`/`select` build plan
   nodes, `collect`/`show`/`count`/`explain` are the only things that
@@ -131,12 +134,62 @@ plan. See `minispark/execution/executor.py`'s module docstring.
 
 - **`minispark/config/`** — `Config`/`EngineConfig`/`ExecutionConfig`/
   `MemoryConfig`/`OptimizerConfig` dataclasses matching the shape in the
-  build spec, and structured logging setup (`log.py`). As of Milestone 2,
-  `OptimizerConfig.predicate_pushdown` and `OptimizerConfig.
-  projection_pruning` are read by `optimizer/optimizer.py`'s
-  `default_rules()` to decide whether to include those two rules; the rest
-  of the config (`execution`, `memory`, and `max_task_retries`) is still
-  unread, waiting on the scheduler/memory-manager that will consume it.
+  build spec, and structured logging setup (`log.py`). As of Milestone 3,
+  `engine.master` (via `EngineConfig.num_workers`) and
+  `engine.max_task_retries` are read by `execution/scheduler.py`'s
+  `LocalScheduler`, and `optimizer.predicate_pushdown` /
+  `optimizer.projection_pruning` are read by `optimizer/optimizer.py`'s
+  `default_rules()`. `execution` and `memory` are still unread, waiting on
+  the shuffle/spill machinery that will consume them.
+
+## Key Milestone-3 design decisions
+
+**Partition row-data had to stop being closures.** `local[N]` with `N > 1`
+sends `Task`s (which carry a whole `PhysicalPlan`, including its `Scan`
+leaf's `Dataset`) to worker processes with the standard library `pickle`
+module. A lambda, or a nested function closing over an enclosing method's
+variables, is not picklable no matter what it captures. `storage/
+memory.py`, `storage/csv.py`, and `core/dataset.py`'s `repartition()` were
+rewritten to build `records_fn` with `functools.partial(iter, rows)` or
+`functools.partial(a_module_level_function, ...)` instead, which pickles
+correctly and preserves `Partition`'s public `records_fn: Callable[[],
+Iterator[Record]]` contract exactly, so nothing that constructs a
+`Partition` directly with a raw lambda (most unit tests, which never cross
+a process boundary) needed to change.
+
+**Retry decisions are made by the scheduler, not inside a worker.**
+`execute_task` (execution/worker.py) already converts an exception into a
+`FAILED` `TaskResult` instead of raising, so "should this be retried" is
+always a plain inspection of a returned value, made in the scheduler's own
+process, whether that value came back from a direct call (`local[1]`) or
+from a `ProcessPoolExecutor` worker (`local[N>1]`). This also means a
+`FAILED` result and a genuinely crashed/killed worker process are
+distinguishable in principle (a crash would show up as the pool itself
+raising, not as a returned `TaskResult`), which matters for honestly
+scoping what Milestone 3's retry actually covers versus what Milestone 6's
+lineage-based recomputation will need to cover.
+
+**Stage splitting is real, even though it only ever produces one stage
+right now.** `execution/stages.py`'s `build_stages()` routes through
+`execution/dag.py`'s dependency classification and explicitly checks for a
+wide dependency (raising `NotImplementedError` if it finds one) rather
+than hardcoding "return one Stage." No physical node is wide until
+Milestone 4's `Aggregate`, so today that check always passes and one stage
+is always the right answer; the check exists so the day it stops being the
+right answer, the code says so loudly instead of silently producing a
+wrong single-stage plan for a query that actually needed a shuffle
+boundary.
+
+**The scheduler's task runner is an injectable constructor argument.**
+`LocalScheduler(run_task=...)` defaults to `execute_task`, but tests can
+pass a synchronous stub instead. This is what keeps
+`tests/unit/test_scheduler.py`'s retry/state-tracking tests fast and
+deterministic (no real subprocess spawn) without weakening what they
+prove: scheduling logic is tested in isolation from the mechanism that
+actually runs a task, and genuine multiprocessing gets its own dedicated
+tests (`tests/integration/test_scheduler_multiprocessing.py`) that assert
+on something a stub cannot fake, an observed worker process id different
+from the driver's.
 
 ## Key Milestone-2 design decisions
 
@@ -245,11 +298,13 @@ used as dict/set keys for value equality.
 
 ## What's deliberately not here yet
 
-Per the build spec's milestone breakdown: DAG/stage/task/scheduler/worker,
-shuffle, joins, aggregations, fault tolerance (retry/lineage/checkpointing),
-columnar execution, SQL, and benchmarking. Each has a numbered section in
-the build spec and lands in the milestone assigned to it, see `README.md`'s
-status section for the current cut line. As of Milestone 2, the analyzer
-and optimizer exist but only validate/rewrite Scan/Filter/Project plans;
-they have no rules for Aggregate/Join/Sort because those nodes do not
-exist yet.
+Per the build spec's milestone breakdown: shuffle, joins, aggregations,
+lineage-based fault recovery, checkpointing, columnar execution, SQL, and
+benchmarking. Each has a numbered section in the build spec and lands in
+the milestone assigned to it, see `README.md`'s status section for the
+current cut line. The analyzer and optimizer exist but only validate/
+rewrite Scan/Filter/Project plans; they have no rules for Aggregate/Join/
+Sort because those nodes do not exist yet. The scheduler exists and
+retries individual task failures, but nothing recomputes a *lost*
+partition via lineage (Milestone 6), and nothing spills to disk under
+memory pressure (Milestone 9).
