@@ -1,8 +1,8 @@
-"""Logical plan nodes: Scan, Filter, Project, Aggregate.
+"""Logical plan nodes: Scan, Filter, Project, Aggregate, Join, Sort.
 
-Join, Sort, Limit, Union, Repartition, Distinct are listed in the target
-architecture but are added alongside the milestones that give them meaning
-(Join/Sort in Milestone 5, etc.) rather than stubbed out empty now.
+Limit, Union, Repartition, Distinct are listed in the target architecture
+but are added alongside the milestone that gives each one meaning, rather
+than stubbed out empty now.
 """
 
 from __future__ import annotations
@@ -132,6 +132,95 @@ class Aggregate(LogicalPlan):
         group_cols = ", ".join(output_name(g) for g in self.group_by)
         agg_cols = ", ".join(output_name(a) for a in self.aggregates)
         return f"Aggregate[groupBy=({group_cols}), aggregates=({agg_cols})]"
+
+
+class Join(LogicalPlan):
+    """Inner equi-join of `left` and `right` on the column names in `on`.
+
+    Scope, deliberately: `on` is a list of column names present (with the
+    same name) on *both* sides, matching the common-case `df.join(other,
+    on="col")` form; differently-named join keys (`left_on`/`right_on`)
+    are not supported. `how` only accepts `"inner"`: left/right/full outer
+    and semi/anti joins are not implemented. Neither limitation is an
+    oversight; both are the scope this milestone's node set covers,
+    documented so a later milestone extending `Join` knows exactly what
+    it is extending.
+
+    `broadcast` is an explicit hint (`DataFrame.join(..., broadcast=True)`),
+    not an automatic decision: MiniSpark has no persistent table catalog
+    and no reliable byte-size estimate to threshold against without
+    scanning data (see optimizer/statistics.py's documented caveats), so
+    automatic broadcast-vs-shuffle selection is not implemented. See
+    physical/planner.py for how this hint changes the physical plan.
+    """
+
+    def __init__(
+        self,
+        left: LogicalPlan,
+        right: LogicalPlan,
+        on: list[str],
+        how: str = "inner",
+        broadcast: bool = False,
+    ):
+        self.left = left
+        self.right = right
+        self.on = on
+        self.how = how
+        self.broadcast = broadcast
+
+    @property
+    def schema(self) -> Schema:
+        left_fields = list(self.left.schema)
+        on_set = set(self.on)
+        right_fields = [f for f in self.right.schema if f.name not in on_set]
+        return Schema(left_fields + right_fields)
+
+    @property
+    def children(self) -> list[LogicalPlan]:
+        return [self.left, self.right]
+
+    @property
+    def node_label(self) -> str:
+        on_cols = ", ".join(self.on)
+        tag = " broadcast" if self.broadcast else ""
+        return f"Join[{self.how}, on=({on_cols})]{tag}"
+
+
+class Sort(LogicalPlan):
+    """Globally sorts `child`'s rows by `sort_exprs`.
+
+    Each entry in `sort_exprs` must be a plain `Column` (enforced by the
+    analyzer), for the same reason `Aggregate.group_by` requires it: the
+    sort key is evaluated per row both for local sorting and as the
+    range-partitioning key for the shuffle that produces a global order
+    (see physical/planner.py, shuffle/partitioner.py's RangePartitioner),
+    so it needs to be something meaningful to partition by, not an
+    arbitrary expression tree. `ascending[i]` controls the direction of
+    `sort_exprs[i]`.
+    """
+
+    def __init__(self, child: LogicalPlan, sort_exprs: list[Expression], ascending: list[bool]):
+        if len(sort_exprs) != len(ascending):
+            raise ValueError("sort_exprs and ascending must be the same length")
+        self.child = child
+        self.sort_exprs = sort_exprs
+        self.ascending = ascending
+
+    @property
+    def schema(self) -> Schema:
+        return self.child.schema
+
+    @property
+    def children(self) -> list[LogicalPlan]:
+        return [self.child]
+
+    @property
+    def node_label(self) -> str:
+        cols = ", ".join(
+            f"{output_name(e)} {'ASC' if asc else 'DESC'}"
+            for e, asc in zip(self.sort_exprs, self.ascending, strict=True)
+        )
+        return f"Sort[{cols}]"
 
 
 def output_name(expr: Expression) -> str:
