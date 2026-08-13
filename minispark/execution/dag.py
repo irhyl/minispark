@@ -9,12 +9,16 @@ Two dependency classes, per the build spec:
     partition must finish and be written out before any wide-dependency
     task can start.
 
-`ScanExec`, `FilterExec`, and `ProjectExec` (the only physical nodes that
-exist as of Milestone 3) are all narrow. This module still builds a real
-DAGNode tree with a per-node classification, not a hardcoded "everything
-is narrow" shortcut, so Milestone 4's Aggregate (and Milestone 5's Join,
-Sort) only need to add a case to `dependency_kind()`; `stages.py`'s stage
-splitting already reads this classification generically.
+`ScanExec`, `FilterExec`, `ProjectExec`, and `HashAggregateExec` are all
+narrow: even `HashAggregateExec` only groups rows *within* the one
+partition it is given (see physical/operators.py), it does not itself
+move data between partitions. `ExchangeExec` is the one wide node: it is
+exactly the marker the physical planner leaves at a shuffle boundary
+(Aggregate's partial-aggregate-then-shuffle-then-final-aggregate shape,
+see physical/planner.py). `ShuffleWriteExec`/`ShuffleReadExec` (the
+post-stage-split rewrite of an `ExchangeExec`, see stages.py) are narrow
+again: by the time either exists, the wide dependency they came from has
+already been resolved into two separate stages.
 """
 
 from __future__ import annotations
@@ -22,9 +26,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum, auto
 
-from minispark.physical.plan import FilterExec, PhysicalPlan, ProjectExec, ScanExec
+from minispark.physical.plan import (
+    ExchangeExec,
+    FilterExec,
+    HashAggregateExec,
+    PhysicalPlan,
+    ProjectExec,
+    ScanExec,
+    ShuffleReadExec,
+    ShuffleWriteExec,
+)
 
-_NARROW_NODE_TYPES = (ScanExec, FilterExec, ProjectExec)
+_NARROW_NODE_TYPES = (
+    ScanExec,
+    FilterExec,
+    ProjectExec,
+    HashAggregateExec,
+    ShuffleWriteExec,
+    ShuffleReadExec,
+)
+_WIDE_NODE_TYPES = (ExchangeExec,)
 
 
 class DependencyKind(Enum):
@@ -36,6 +57,8 @@ def dependency_kind(plan: PhysicalPlan) -> DependencyKind:
     """The dependency `plan` has on its child(ren)."""
     if isinstance(plan, _NARROW_NODE_TYPES):
         return DependencyKind.NARROW
+    if isinstance(plan, _WIDE_NODE_TYPES):
+        return DependencyKind.WIDE
     raise NotImplementedError(
         f"No dependency classification for physical node {type(plan).__name__}"
     )
