@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+*.log
+
+# generated data / benchmark artifacts (not source) — small hand-written
+# sample files like data/users.csv are tracked; generated datasets are not.
+data/generated/
+output/
+checkpoints/
+shuffle/
+benchmarks/results/
