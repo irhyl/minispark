@@ -18,6 +18,12 @@ process cannot). The exception is reported as a formatted string, not
 re-raised as an exception object: exception instances are not guaranteed
 picklable/reconstructable across a process boundary (they may hold
 unpicklable state, e.g. a file handle), a message string always is.
+
+A task whose plan is rooted at `ShuffleWriteExec` (its stage ends at a
+shuffle boundary, see execution/stages.py) takes a different path: its
+output is shuffle blocks written to disk, not rows returned to the
+driver. `_execute_shuffle_write_task` handles that case; every other task
+goes through the normal `execute_partition` -> rows path.
 """
 
 from __future__ import annotations
@@ -27,7 +33,9 @@ import time
 
 from minispark.execution.tasks import Task, TaskContext, TaskMetrics, TaskResult, TaskState
 from minispark.physical.operators import execute_partition
-from minispark.physical.plan import PhysicalPlan, ScanExec
+from minispark.physical.plan import PhysicalPlan, ScanExec, ShuffleReadExec, ShuffleWriteExec
+from minispark.shuffle.partitioner import HashPartitioner
+from minispark.shuffle.writer import write_shuffle_partition
 
 
 def execute_task(task: Task, attempt_number: int = 0) -> TaskResult:
@@ -39,8 +47,10 @@ def execute_task(task: Task, attempt_number: int = 0) -> TaskResult:
     )
     start = time.perf_counter()
     try:
-        partition = execute_partition(task.plan, task.partition_id)
-        rows = partition.to_list()
+        if isinstance(task.plan, ShuffleWriteExec):
+            result = _execute_shuffle_write_task(task)
+        else:
+            result = _execute_normal_task(task)
     except Exception as exc:
         elapsed = time.perf_counter() - start
         return TaskResult(
@@ -49,33 +59,87 @@ def execute_task(task: Task, attempt_number: int = 0) -> TaskResult:
             metrics=TaskMetrics(execution_time_seconds=elapsed),
             error=f"{type(exc).__name__}: {exc}",
         )
-    elapsed = time.perf_counter() - start
+    result.metrics.execution_time_seconds = time.perf_counter() - start
+    return result
+
+
+def _execute_normal_task(task: Task) -> TaskResult:
+    partition = execute_partition(task.plan, task.partition_id, task.shuffle_blocks)
+    rows = partition.to_list()
     metrics = TaskMetrics(
-        execution_time_seconds=elapsed,
-        input_records=_input_record_count(task.plan, task.partition_id),
+        input_records=_input_record_count(task),
         output_records=len(rows),
         output_bytes=_estimate_bytes(rows),
+        shuffle_bytes=_shuffle_read_bytes(task),
     )
     return TaskResult(task_id=task.task_id, state=TaskState.SUCCESS, rows=rows, metrics=metrics)
 
 
-def _input_record_count(plan: PhysicalPlan, partition_id: int) -> int | None:
-    """The source partition's row count, from Partition metadata if known.
+def _execute_shuffle_write_task(task: Task) -> TaskResult:
+    write_exec = task.plan
+    assert isinstance(write_exec, ShuffleWriteExec)
+    if task.shuffle_root_dir is None:
+        raise ValueError(
+            f"ShuffleWriteExec task {task.task_id} has no shuffle_root_dir "
+            "(see execution/scheduler.py, which must set it on every task "
+            "in a shuffle-write stage)"
+        )
+    parent = execute_partition(write_exec.child, task.partition_id, task.shuffle_blocks)
+    rows = list(parent)
+    partition_exprs = write_exec.partition_exprs
 
-    Read from metadata (already populated by CSVDataSource/MemoryDataSource)
-    rather than by scanning: the task is about to read this partition's
-    rows anyway, scanning it twice just to count would double CSV I/O for
-    no benefit. Returns None if the metadata does not know (metadata is
-    optional; see core/partition.py).
+    def key_fn(record: dict) -> tuple:
+        return tuple(expr.evaluate(record) for expr in partition_exprs)
+
+    blocks = write_shuffle_partition(
+        root_dir=task.shuffle_root_dir,
+        stage_id=task.stage_id,
+        source_task_id=task.task_id,
+        records=rows,
+        key_fn=key_fn,
+        partitioner=HashPartitioner(write_exec.num_partitions),
+    )
+    metrics = TaskMetrics(
+        input_records=_input_record_count(task),
+        output_records=0,
+        output_bytes=0,
+        shuffle_bytes=sum(b.byte_length for b in blocks),
+    )
+    return TaskResult(
+        task_id=task.task_id,
+        state=TaskState.SUCCESS,
+        rows=[],
+        metrics=metrics,
+        shuffle_blocks=blocks,
+    )
+
+
+def _input_record_count(task: Task) -> int | None:
+    """The source partition's row count, read from cheap, already-known
+    information rather than by scanning: Partition metadata for a Scan
+    leaf (populated by CSVDataSource/MemoryDataSource), or the shuffle
+    block metadata's record counts for a ShuffleReadExec leaf (already
+    known from the write side, see shuffle/writer.py). Returns None if
+    neither source knows.
     """
-    scan = _leaf_scan(plan)
-    return scan.dataset.partition(partition_id).row_count()
+    leaf = _leaf_node(task.plan)
+    if isinstance(leaf, ScanExec):
+        return leaf.dataset.partition(task.partition_id).row_count()
+    if isinstance(leaf, ShuffleReadExec) and task.shuffle_blocks is not None:
+        return sum(b.record_count for b in task.shuffle_blocks)
+    return None
 
 
-def _leaf_scan(plan: PhysicalPlan) -> ScanExec:
-    if isinstance(plan, ScanExec):
+def _shuffle_read_bytes(task: Task) -> int:
+    if isinstance(_leaf_node(task.plan), ShuffleReadExec) and task.shuffle_blocks is not None:
+        return sum(b.byte_length for b in task.shuffle_blocks)
+    return 0
+
+
+def _leaf_node(plan: PhysicalPlan) -> PhysicalPlan:
+    if not plan.children:
         return plan
-    return _leaf_scan(plan.children[0])
+    return _leaf_node(plan.children[0])
 
 
 def _estimate_bytes(rows: list[dict]) -> int:
