@@ -1,6 +1,6 @@
 # Execution Model
 
-How a physical plan becomes running tasks, as of Milestone 4. See
+How a physical plan becomes running tasks, as of Milestone 5. See
 `docs/query-planning.md` for everything upstream of this (logical plan,
 analyzer, optimizer, physical plan) and `docs/shuffle.md` for what
 specifically happens at a shuffle boundary; this document covers the
@@ -49,30 +49,44 @@ what a shuffle boundary is. Producing a wide-dependency operator's output
 needs every upstream partition to finish and be written out before any
 downstream task can start, which is why it forces a stage boundary.
 
-`ScanExec`, `FilterExec`, `ProjectExec`, and `HashAggregateExec` are all
-narrow: even `HashAggregateExec` only groups rows *within* the one
-partition it is given (see docs/shuffle.md), it does not itself move data
-between partitions. `ExchangeExec` is the one wide node, the marker the
-physical planner (`physical/planner.py`) leaves at a shuffle boundary
-when it translates `group_by(...).agg(...)` into a partial aggregate, an
-exchange, and a final aggregate. `execution/dag.py`'s `dependency_kind()`
-classifies every node that exists; `execution/stages.py`'s
-`build_stages()` walks the plan and, at each `ExchangeExec`, rewrites it
-into a `ShuffleWriteExec` (closing the upstream stage) and a
-`ShuffleReadExec` (opening the downstream stage). A plan with no
+`ScanExec`, `FilterExec`, `ProjectExec`, `HashAggregateExec`,
+`HashJoinExec`, and `SortExec` are all narrow: even `HashJoinExec` only
+builds and probes a hash table *within* the one partition (pair) it is
+given, and even `SortExec` only sorts the rows *within* the one partition
+it is given (see docs/shuffle.md); none of them move data between
+partitions on their own. `ExchangeExec` is the one wide node, the marker
+the physical planner (`physical/planner.py`) leaves at a shuffle
+boundary: `group_by(...).agg(...)`'s partial-aggregate/exchange/final-
+aggregate shape, `join(...)`'s shuffled-or-broadcast side(s), and
+`order_by(...)`'s local-sort/range-exchange/final-sort shape all produce
+one or more of them. `execution/dag.py`'s `dependency_kind()` classifies
+every node that exists; `execution/stages.py`'s `build_stages()` walks
+the plan and, at each `ExchangeExec`, rewrites it into a
+`ShuffleWriteExec` (closing the upstream stage) and a `ShuffleReadExec`
+(opening the downstream stage). A `HashJoinExec` has two children, so
+`build_stages()` splits each side independently; either, both, or
+neither may close off its own upstream stage(s) (a shuffle hash join
+closes both, a broadcast join only the broadcast side). A plan with no
 `ExchangeExec` still produces exactly one stage, unchanged from
-Milestone 3; a plan with one produces two; a plan with more than one
-(e.g. two chained `group_by().agg()` calls) produces more than two, the
-splitting is not special-cased to "at most one shuffle."
+Milestone 3; a plan with one produces two (a `group_by`, or a broadcast
+join); a plan with more (a shuffle hash join produces three: two writes,
+one join; `order_by` produces two: one write, one final sort; a query
+combining several of these produces more still), the splitting is not
+special-cased to "at most one shuffle."
 
 ## Task, TaskContext, TaskResult, TaskMetrics
 
 A `Task` (`execution/tasks.py`) is one partition of one stage: it carries
 `task_id`, `stage_id`, `partition_id`, and the stage's whole `PhysicalPlan`
-(shared across every task in that stage). `TaskContext` carries per-attempt
-identity (`attempt_number`) into a task's execution for logging; nothing
-reads from it yet beyond that (no accumulators, no broadcast-variable
-access: not needed by anything that exists).
+(shared across every task in that stage). `shuffle_blocks` is keyed by
+source `stage_id` (`dict[int, list[ShuffleBlockMeta]]`), not a single
+flat list: a `HashJoinExec`-rooted stage reads from two prior stages, one
+per side, and each `ShuffleReadExec` leaf needs to find only its own
+stage's blocks (see docs/shuffle.md's "Reading from more than one prior
+stage"). `TaskContext` carries per-attempt identity (`attempt_number`)
+into a task's execution for logging; nothing reads from it yet beyond
+that (no accumulators, no broadcast-variable access: not needed by
+anything that exists).
 
 `TaskMetrics` fields and what they actually are:
 
@@ -158,7 +172,8 @@ observing a worker's OS process id
 
 No DAG scheduler in the Spark sense (stage retries, speculative execution,
 locality-aware placement), no lineage-based fault recovery, no
-checkpointing, no dynamic resource allocation, no join (so no
-broadcast-join alternative to a shuffle). `local[N]` is real
-multiprocessing on one machine; nothing here talks to another machine, and
-nothing claims to.
+checkpointing, no dynamic resource allocation, no cost-based join
+strategy selection (broadcast is an explicit hint, see
+`logical/nodes.py`'s `Join` docstring), no sort-merge join (only hash
+join, broadcast or shuffled). `local[N]` is real multiprocessing on one
+machine; nothing here talks to another machine, and nothing claims to.
