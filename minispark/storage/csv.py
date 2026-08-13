@@ -20,7 +20,9 @@ skipped here as unnecessary complexity for Milestone 1's goals.
 from __future__ import annotations
 
 import csv
+import functools
 import itertools
+from collections.abc import Iterator
 from pathlib import Path
 
 from minispark.core.dataset import Dataset
@@ -81,6 +83,25 @@ def _coerce_row(header: list[str], row: list[str]) -> Record:
     return {name: _try_parse(raw) for name, raw in zip(header, row, strict=True)}
 
 
+def _read_csv_range(path: Path, header: list[str], start: int, end: int) -> Iterator[Record]:
+    """Stream rows `[start, end)` of `path`, re-opening the file.
+
+    Module-level, not a nested closure, so `CSVDataSource._make_records_fn`
+    can bind it with `functools.partial` into a picklable `records_fn`. A
+    closure over `path`/`header`/`start`/`end` captured from an enclosing
+    method is not picklable by the standard library `pickle` module (used
+    by `multiprocessing`); a `functools.partial` wrapping a module-level
+    function and picklable arguments is. See storage/memory.py's
+    `_make_records_fn` for the same fix on the in-memory source.
+    """
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        next(reader)  # header
+        window = itertools.islice(reader, start, end)
+        for row in window:
+            yield _coerce_row(header, row)
+
+
 class CSVDataSource(DataSource):
     def __init__(self, path: str, schema: Schema | None = None, num_partitions: int = 4):
         self._path = Path(path)
@@ -118,22 +139,12 @@ class CSVDataSource(DataSource):
             )
         if not partitions:
             partitions = [
-                Partition(0, schema, (lambda: iter([])), PartitionMetadata(row_count=0))
+                Partition(0, schema, functools.partial(iter, []), PartitionMetadata(row_count=0))
             ]
         return Dataset(schema, partitions)
 
     def _make_records_fn(self, header: list[str], start: int, end: int):
-        path = self._path
-
-        def _records():
-            with path.open(newline="", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                next(reader)  # header
-                window = itertools.islice(reader, start, end)
-                for row in window:
-                    yield _coerce_row(header, row)
-
-        return _records
+        return functools.partial(_read_csv_range, self._path, header, start, end)
 
 
 def read_csv(path: str, schema: Schema | None = None, num_partitions: int = 4) -> Dataset:
