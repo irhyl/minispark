@@ -30,21 +30,23 @@ Scheduler
    |
 Task Execution
    |
-Storage / Shuffle          <- Shuffle not yet implemented (Milestone 4)
+Storage / Shuffle
 ```
 
-**Milestone 3 status**: everything above "Storage / Shuffle" is
-implemented, except the shuffle half of the bottom layer. `DataFrame`
-actions (`collect`/`show`/`count`/`explain`) now run, in order:
+**Milestone 4 status**: every layer above is implemented. `DataFrame`
+actions (`collect`/`show`/`count`/`explain`) run, in order:
 `logical/analyzer.py` (validates the plan), `optimizer/optimizer.py`
-(rewrites it), `physical/planner.py` (translates it to a physical plan),
-`execution/stages.py` (splits it into stages; today always exactly one,
-see `docs/execution-model.md`), `execution/scheduler.py`'s
-`LocalScheduler` (turns the stage into `Task`s and runs them, either
-sequentially or across a real `ProcessPoolExecutor` depending on
-`local[N]`). See `docs/execution-model.md` for the full DAG/Stage/Task/
-Worker/Scheduler picture; this file stays focused on package layout and
-design decisions.
+(rewrites it), `physical/planner.py` (translates it to a physical plan,
+including turning `group_by(...).agg(...)` into a partial aggregate, a
+shuffle exchange, and a final aggregate), `execution/stages.py` (splits
+it into stages at shuffle boundaries; one stage for a shuffle-free plan,
+two or more for a plan with `group_by`, see `docs/execution-model.md`),
+`execution/scheduler.py`'s `LocalScheduler` (runs each stage's `Task`s,
+either sequentially or across a real `ProcessPoolExecutor` depending on
+`local[N]`, moving data between stages through a real disk-backed
+shuffle, see `docs/shuffle.md`). See `docs/execution-model.md` for the
+full DAG/Stage/Task/Worker/Scheduler picture; this file stays focused on
+package layout and design decisions.
 
 `minispark/execution/executor.py` (Milestone 1's naive, single-process,
 logical-plan interpreter) and `physical/operators.py`'s whole-Dataset
@@ -77,37 +79,53 @@ equivalent unoptimized plan.
   arrays when columnar execution (Milestone 7) lands — row-at-a-time
   evaluation should not be assumed to be the permanent execution strategy.
 
-- **`minispark/logical/`**: `Scan`, `Filter`, `Project` plan nodes, an
-  `explain()` pretty-printer (`plan.py`), and (Milestone 2) `analyzer.py`.
-  Aggregate/Join/Sort/Limit/Union/Repartition/Distinct nodes are
+- **`minispark/logical/`**: `Scan`, `Filter`, `Project`, and (Milestone 4)
+  `Aggregate` plan nodes, an `explain()` pretty-printer (`plan.py`), and
+  `analyzer.py`. Join/Sort/Limit/Union/Repartition/Distinct nodes are
   intentionally not stubbed out empty here; they are added in the
-  milestone that gives each one real behavior (e.g. `Aggregate` alongside
-  shuffle-based group-by in Milestone 4) so that "the node exists" always
-  means "the node does something." `analyzer.py`'s `analyze()` validates
-  every `Column` reference in a plan against its child schema before
-  anything executes, raising `AnalysisException` with the offending column
-  name and the available columns; it does not do type inference beyond
-  "does this column exist" (see Key design decisions below).
+  milestone that gives each one real behavior so that "the node exists"
+  always means "the node does something." `Aggregate` requires its
+  `group_by` entries to be plain `Column`s, not computed expressions
+  (the group key is evaluated as a shuffle-partitioning key, see
+  `docs/shuffle.md`, not a general expression). `analyzer.py`'s
+  `analyze()` validates every `Column` reference in a plan against its
+  child schema before anything executes (including inside `Aggregate`'s
+  `group_by` and aggregate expressions), raising `AnalysisException` with
+  the offending column name and the available columns; it does not do
+  type inference beyond "does this column exist" (see Key design
+  decisions below).
 
-- **`minispark/optimizer/`** (Milestone 2): `rules.py` (five rules:
-  `ConstantFolding`, `FilterSimplification`, `PredicatePushdown`,
-  `ProjectionPruning`, `RedundantProjectionElimination`), `optimizer.py`
-  (`Optimizer`, which runs the rule list to a text-comparison fixed point),
-  `statistics.py` (`compute_statistics()`, an exact full-scan statistics
-  computation that nothing consumes yet). Depends on `logical/` only, never
-  on `physical/` or `execution/`: an optimizer rule rewrites plan shape, it
-  never touches a Dataset or a Partition.
+- **`minispark/optimizer/`**: `rules.py` (five rules: `ConstantFolding`,
+  `FilterSimplification`, `PredicatePushdown`, `ProjectionPruning`,
+  `RedundantProjectionElimination`, every one of which now has an
+  `Aggregate` case alongside its `Scan`/`Filter`/`Project` cases),
+  `optimizer.py` (`Optimizer`, which runs the rule list to a
+  text-comparison fixed point), `statistics.py` (`compute_statistics()`,
+  an exact full-scan statistics computation that nothing consumes yet).
+  Depends on `logical/` only, never on `physical/` or `execution/`: an
+  optimizer rule rewrites plan shape, it never touches a Dataset or a
+  Partition.
 
 - **`minispark/physical/`**: `plan.py` (`ScanExec`, `FilterExec`,
-  `ProjectExec`, one physical node per logical node type), `planner.py`
-  (`plan_physical()`, a 1:1 structural translation today), `operators.py`
-  (Milestone 2's `execute()`, which walks a whole `PhysicalPlan` into a
-  `Dataset` and is now an oracle only; Milestone 3's `execute_partition()`,
-  which does the same walk for exactly one partition and is what a Task
-  actually runs). This package is the seam Milestone 4/5 use to make a
-  real choice (HashAggregate vs SortAggregate, HashJoin vs BroadcastJoin)
-  instead of a 1:1 copy; it exists now, ahead of that being interesting,
-  so the seam does not have to be retrofitted later.
+  `ProjectExec`, `HashAggregateExec`, `ExchangeExec`, `ShuffleWriteExec`,
+  `ShuffleReadExec`), `planner.py` (`plan_physical()`; 1:1 for
+  Scan/Filter/Project, but `Aggregate` becomes a partial
+  `HashAggregateExec` -> `ExchangeExec` -> final `HashAggregateExec`
+  chain, see `docs/shuffle.md`), `operators.py` (`execute()`, a
+  whole-Dataset oracle only; `execute_partition()`, what a Task actually
+  runs, now with cases for `HashAggregateExec` and `ShuffleReadExec`).
+  `ExchangeExec`/`ShuffleWriteExec`/`ShuffleReadExec` are the seam
+  Milestone 5's Join will extend (a broadcast join needs a different
+  exchange strategy than a shuffle join); it exists now, ahead of that
+  being interesting, so the seam does not have to be retrofitted later.
+
+- **`minispark/shuffle/`** (Milestone 4): `partitioner.py`
+  (`HashPartitioner`, the one actually used; `RangePartitioner`, built
+  for the build spec's ask but with no consumer until Milestone 5's
+  `Sort`), `writer.py`/`reader.py` (disk-backed, checksummed shuffle
+  blocks), `manager.py` (`ShuffleManager`, driver-side bookkeeping of
+  which blocks exist for which stage/partition). See `docs/shuffle.md`
+  for the full picture. Depends on `core/` only.
 
 - **`minispark/storage/`** — `DataSource` (abstract), `MemoryDataSource`,
   `CSVDataSource`. Depends only on `core/`. A `Scan` logical node holds an
@@ -116,31 +134,80 @@ equivalent unoptimized plan.
   data model it produces.
 
 - **`minispark/execution/`**: `executor.py` (Milestone 1's naive
-  logical-plan interpreter, kept only as a correctness oracle) plus, as of
-  Milestone 3, `dag.py`, `stages.py`, `tasks.py`, `worker.py`, and
-  `scheduler.py`. See `docs/execution-model.md` for what each of these
-  does and how they fit together; that document, not this one, is the
-  place to look for the full DAG/Stage/Task/Worker/Scheduler picture.
+  logical-plan interpreter, kept only as a correctness oracle), `dag.py`,
+  `stages.py`, `tasks.py`, `worker.py`, `scheduler.py`. See
+  `docs/execution-model.md` for what each of these does and how they fit
+  together; that document, not this one, is the place to look for the
+  full DAG/Stage/Task/Worker/Scheduler picture.
 
-- **`minispark/api/`** — `DataFrame` (lazy; `filter`/`select` build plan
-  nodes, `collect`/`show`/`count`/`explain` are the only things that
-  trigger analysis/optimization/execution), `MiniSparkSession` (+
-  builder), `functions.py` (`col()`, `lit()`). `explain(optimized=False)`
-  (the default) prints the raw logical plan, matching Milestone 1's
-  behavior exactly. `explain(optimized=True)` prints three sections in
-  order: "Analyzed Logical Plan" (post-`analyze()`, pre-rewrite),
+- **`minispark/api/`** — `DataFrame` (lazy; `filter`/`select`/`group_by`
+  build plan nodes, `collect`/`show`/`count`/`explain` are the only
+  things that trigger analysis/optimization/execution), `grouped.py`
+  (`GroupedData`, the result of `group_by()` before `.agg()` turns it
+  back into a `DataFrame`), `MiniSparkSession` (+ builder), `functions.py`
+  (`col()`, `lit()`, `count()`, `sum()`, `avg()`, `min()`, `max()`).
+  `explain(optimized=False)` (the default) prints the raw logical plan,
+  matching Milestone 1's behavior exactly. `explain(optimized=True)`
+  prints "Analyzed Logical Plan" (post-`analyze()`, pre-rewrite),
   "Optimized Logical Plan" (post-`Optimizer.optimize()`), "Physical Plan"
-  (post-`plan_physical()`), so a user can see what each stage changed.
+  (post-`plan_physical()`), and "Stages" (post-`build_stages()`, one
+  section per stage), so a user can see what each step changed.
 
 - **`minispark/config/`** — `Config`/`EngineConfig`/`ExecutionConfig`/
   `MemoryConfig`/`OptimizerConfig` dataclasses matching the shape in the
-  build spec, and structured logging setup (`log.py`). As of Milestone 3,
+  build spec, and structured logging setup (`log.py`). As of Milestone 4,
   `engine.master` (via `EngineConfig.num_workers`) and
   `engine.max_task_retries` are read by `execution/scheduler.py`'s
-  `LocalScheduler`, and `optimizer.predicate_pushdown` /
+  `LocalScheduler`; `optimizer.predicate_pushdown` /
   `optimizer.projection_pruning` are read by `optimizer/optimizer.py`'s
-  `default_rules()`. `execution` and `memory` are still unread, waiting on
-  the shuffle/spill machinery that will consume them.
+  `default_rules()`; `execution.shuffle_partitions` is read by
+  `physical/planner.py` when translating an `Aggregate` (how many
+  reduce-side partitions the shuffle fans out to). `execution.
+  partition_size_mb`, `execution.shuffle_compression`, and `memory` are
+  still unread.
+
+## Key Milestone-4 design decisions
+
+**`HashPartitioner` cannot use Python's builtin `hash()`.** CPython
+randomizes `hash()` for `str` per process (`PYTHONHASHSEED`) unless
+disabled. Two worker processes computing a group key's target partition
+with the builtin `hash()` could disagree on the same string key, silently
+splitting one group's rows across two shuffle target partitions, a
+correctness bug that would not show up in single-process testing.
+`shuffle/partitioner.py` uses `hashlib.md5` over `repr(key)` instead,
+which is stable across processes; verified in `tests/unit/
+test_partitioner.py` by spawning a real second Python process.
+
+**Grouping is not streaming; a shuffle write is.** `HashAggregateExec`
+(physical/operators.py) has to see every row for a key (within one
+partition) before it knows that group's final state, so it builds a
+`dict` up front rather than yielding lazily like `FilterExec`/
+`ProjectExec` do. `shuffle/writer.py`, by contrast, writes one record at
+a time to whichever target file it belongs to, the only per-target state
+kept in memory is one open file handle and a running checksum. Spilling
+the aggregate's hash table to disk under memory pressure is not
+implemented (Milestone 9); the architecture note is in `docs/shuffle.md`.
+
+**Shuffle blocks are pickled records, not JSON lines.** `Avg`'s partial
+state is a `(sum, count)` tuple (`expressions/aggregate.py`); JSON would
+silently turn that into a list on the way back out, and cannot represent
+`NaN` by default. Every worker process reading a shuffle block is already
+a MiniSpark process willing to unpickle MiniSpark data (the same trust
+boundary Milestone 3's Task/PhysicalPlan picklability already relies on),
+so pickle costs nothing extra in trust and preserves exact types.
+
+**`ExchangeExec` and `ShuffleWriteExec`/`ShuffleReadExec` are different
+node types, not the same one used two ways.** `physical/planner.py`
+leaves an abstract `ExchangeExec` marker at a shuffle boundary; only
+`execution/stages.py`'s `build_stages()` rewrites it into the concrete
+`ShuffleWriteExec` (ends the upstream stage)/`ShuffleReadExec` (starts
+the downstream stage) pair a Task actually executes. This keeps "the
+physical plan says a shuffle happens here" (visible in `explain(
+optimized=True)`'s "Physical Plan" section) separate from "here is
+concretely how that shuffle is split across two stages" (the "Stages"
+section): a bare `ExchangeExec` reaching a worker is a stage-splitting
+bug, not a valid state, and the type system distinguishes the two rather
+than relying on a flag.
 
 ## Key Milestone-3 design decisions
 
@@ -298,13 +365,15 @@ used as dict/set keys for value equality.
 
 ## What's deliberately not here yet
 
-Per the build spec's milestone breakdown: shuffle, joins, aggregations,
-lineage-based fault recovery, checkpointing, columnar execution, SQL, and
-benchmarking. Each has a numbered section in the build spec and lands in
-the milestone assigned to it, see `README.md`'s status section for the
-current cut line. The analyzer and optimizer exist but only validate/
-rewrite Scan/Filter/Project plans; they have no rules for Aggregate/Join/
-Sort because those nodes do not exist yet. The scheduler exists and
-retries individual task failures, but nothing recomputes a *lost*
-partition via lineage (Milestone 6), and nothing spills to disk under
-memory pressure (Milestone 9).
+Per the build spec's milestone breakdown: joins, sort, lineage-based
+fault recovery, checkpointing, columnar execution, SQL, and benchmarking.
+Each has a numbered section in the build spec and lands in the milestone
+assigned to it, see `README.md`'s status section for the current cut
+line. The analyzer, optimizer, and physical planner all handle
+`Aggregate` now, but none of them have a `Join`/`Sort` case yet, those
+nodes do not exist. The scheduler exists and retries individual task
+failures, and a real shuffle exists, but nothing recomputes a *lost*
+partition via lineage (Milestone 6), nothing spills an in-progress
+aggregate's hash table to disk under memory pressure (Milestone 9), and
+shuffle output is never compressed (`ExecutionConfig.shuffle_compression`
+exists but is unread).
