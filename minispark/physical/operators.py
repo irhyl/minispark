@@ -3,11 +3,12 @@
 Deliberately mirrors execution/executor.py's per-node logic almost exactly
 for Scan/Filter/Project: there is only one way to execute those, so "the
 physical strategy" and "the naive logical interpretation" happen to
-compute the same thing. HashAggregateExec and ShuffleReadExec have no
-equivalent in execution/executor.py at all (the naive executor only knows
-Scan/Filter/Project): grouping fundamentally needs a shuffle to be
-correct across partitions, which is exactly what Milestone 3's
-single-process, single-stage naive executor cannot do.
+compute the same thing. HashAggregateExec, HashJoinExec, and
+ShuffleReadExec have no equivalent in execution/executor.py at all (the
+naive executor only knows Scan/Filter/Project): grouping and joining
+fundamentally need a shuffle to be correct across partitions, which is
+exactly what Milestone 3's single-process, single-stage naive executor
+cannot do.
 """
 
 from __future__ import annotations
@@ -24,13 +25,21 @@ from minispark.logical.nodes import output_name
 from minispark.physical.plan import (
     FilterExec,
     HashAggregateExec,
+    HashJoinExec,
     PhysicalPlan,
     ProjectExec,
     ScanExec,
     ShuffleReadExec,
+    SortExec,
 )
 from minispark.shuffle.reader import read_shuffle_blocks
 from minispark.shuffle.writer import ShuffleBlockMeta
+
+# Keyed by source stage_id: a Task whose plan reads from more than one
+# prior stage (a HashJoinExec-rooted stage reads from two) needs each
+# ShuffleReadExec leaf to find only its own stage's blocks, not the
+# other leaf's. See execution/scheduler.py for how this dict is built.
+ShuffleBlocksByStage = dict[int, list[ShuffleBlockMeta]]
 
 
 def execute(plan: PhysicalPlan) -> Dataset:
@@ -89,7 +98,7 @@ def _execute_project(plan: ProjectExec) -> Dataset:
 def execute_partition(
     plan: PhysicalPlan,
     partition_id: int,
-    shuffle_blocks: list[ShuffleBlockMeta] | None = None,
+    shuffle_blocks: ShuffleBlocksByStage | None = None,
 ) -> Partition:
     """Execute physical operators for exactly one partition.
 
@@ -101,15 +110,17 @@ def execute_partition(
     whole (every physical node and expression is plain, picklable data,
     and Milestone 3's fix to storage/memory.py and storage/csv.py made
     Dataset/Partition picklable too); `execute_partition` picks out a
-    single source partition at the ScanExec leaf instead of reading
+    single source partition at each `ScanExec` leaf instead of reading
     `plan.dataset` in full.
 
-    `shuffle_blocks` is only meaningful when `plan` contains a
-    `ShuffleReadExec` (a stage that reads a prior stage's shuffle output):
-    the caller (execution/worker.py) already knows exactly which blocks
-    belong to this partition (filtered driver-side by
-    `shuffle/manager.py`'s `ShuffleManager.blocks_for()`) and passes that
-    fixed list in, rather than this function looking anything up itself.
+    `shuffle_blocks` is only meaningful when `plan` contains one or more
+    `ShuffleReadExec` leaves (a stage that reads a prior stage's shuffle
+    output; a `HashJoinExec`-rooted stage can have two, one per side): the
+    caller (execution/worker.py) already knows exactly which blocks
+    belong to this partition for each upstream stage (filtered driver-side
+    by `shuffle/manager.py`'s `ShuffleManager.blocks_for()`) and passes
+    that fixed, per-stage mapping in, rather than this function looking
+    anything up itself.
     """
     if isinstance(plan, ScanExec):
         return plan.dataset.partition(partition_id)
@@ -119,6 +130,10 @@ def execute_partition(
         return _execute_project_partition(plan, partition_id, shuffle_blocks)
     if isinstance(plan, HashAggregateExec):
         return _execute_hash_aggregate_partition(plan, partition_id, shuffle_blocks)
+    if isinstance(plan, HashJoinExec):
+        return _execute_hash_join_partition(plan, partition_id, shuffle_blocks)
+    if isinstance(plan, SortExec):
+        return _execute_sort_partition(plan, partition_id, shuffle_blocks)
     if isinstance(plan, ShuffleReadExec):
         return _execute_shuffle_read_partition(plan, partition_id, shuffle_blocks)
     raise NotImplementedError(
@@ -127,7 +142,7 @@ def execute_partition(
 
 
 def _execute_filter_partition(
-    plan: FilterExec, partition_id: int, shuffle_blocks: list[ShuffleBlockMeta] | None
+    plan: FilterExec, partition_id: int, shuffle_blocks: ShuffleBlocksByStage | None
 ) -> Partition:
     parent = execute_partition(plan.child, partition_id, shuffle_blocks)
     condition = plan.condition
@@ -141,7 +156,7 @@ def _execute_filter_partition(
 
 
 def _execute_project_partition(
-    plan: ProjectExec, partition_id: int, shuffle_blocks: list[ShuffleBlockMeta] | None
+    plan: ProjectExec, partition_id: int, shuffle_blocks: ShuffleBlocksByStage | None
 ) -> Partition:
     parent = execute_partition(plan.child, partition_id, shuffle_blocks)
     columns = plan.columns
@@ -170,7 +185,7 @@ def _unwrap_aggregate(expr: Expression) -> AggregateFunction:
 
 
 def _execute_hash_aggregate_partition(
-    plan: HashAggregateExec, partition_id: int, shuffle_blocks: list[ShuffleBlockMeta] | None
+    plan: HashAggregateExec, partition_id: int, shuffle_blocks: ShuffleBlocksByStage | None
 ) -> Partition:
     """Group this one partition's rows by `plan.group_by` and combine
     `plan.aggregates` per group.
@@ -228,18 +243,111 @@ def _execute_hash_aggregate_partition(
 
 
 def _execute_shuffle_read_partition(
-    plan: ShuffleReadExec, partition_id: int, shuffle_blocks: list[ShuffleBlockMeta] | None
+    plan: ShuffleReadExec, partition_id: int, shuffle_blocks: ShuffleBlocksByStage | None
 ) -> Partition:
-    if shuffle_blocks is None:
+    if shuffle_blocks is None or plan.from_stage_id not in shuffle_blocks:
         raise ValueError(
             f"ShuffleReadExec for stage {plan.from_stage_id} partition {partition_id} "
-            "was executed with no shuffle_blocks; the caller must supply the block "
-            "list for this partition (see execution/worker.py)."
+            "was executed with no blocks for that stage; the caller must supply a "
+            "shuffle_blocks[stage_id] entry for every ShuffleReadExec in the plan "
+            "(see execution/worker.py, execution/scheduler.py)."
         )
-    records = list(read_shuffle_blocks(shuffle_blocks))
+    blocks = shuffle_blocks[plan.from_stage_id]
+    records = list(read_shuffle_blocks(blocks))
     return Partition(
         partition_id,
         plan.schema,
         functools.partial(iter, records),
         PartitionMetadata(row_count=len(records)),
     )
+
+
+def _execute_hash_join_partition(
+    plan: HashJoinExec, partition_id: int, shuffle_blocks: ShuffleBlocksByStage | None
+) -> Partition:
+    """Build a hash table on `left`'s rows (keyed by `left_keys`), then
+    probe it with `right`'s rows (keyed by `right_keys`), for this one
+    partition. By the time this runs, `left` and `right` already produce
+    exactly the rows this partition's join needs to see, whether that is
+    because both sides were shuffle-partitioned by the same key (shuffle
+    hash join) or because `right` is a full broadcast copy read
+    identically by every partition (broadcast join); see
+    physical/planner.py for which case built this node's children.
+
+    Building on `left` (rather than choosing the smaller side) is a fixed
+    choice, not a cost-based one: nothing here has a reliable, cheap
+    byte-size estimate for either side to choose from (see
+    optimizer/statistics.py's documented caveats and logical/nodes.py's
+    `Join` docstring on why broadcast side selection is an explicit hint,
+    not automatic).
+    """
+    left_partition = execute_partition(plan.left, partition_id, shuffle_blocks)
+    right_partition = execute_partition(plan.right, partition_id, shuffle_blocks)
+    left_keys = plan.left_keys
+    right_keys = plan.right_keys
+    on_set = set(plan.on)
+
+    table: dict[tuple, list[Record]] = {}
+    for record in left_partition:
+        key = tuple(e.evaluate(record) for e in left_keys)
+        table.setdefault(key, []).append(record)
+
+    right_rows = list(right_partition)
+    output_schema = plan.schema
+
+    def records_fn() -> Iterator[Record]:
+        for right_row in right_rows:
+            key = tuple(e.evaluate(right_row) for e in right_keys)
+            for left_row in table.get(key, ()):
+                merged = dict(left_row)
+                for name, value in right_row.items():
+                    if name not in on_set:
+                        merged[name] = value
+                yield merged
+
+    return Partition(partition_id, output_schema, records_fn, PartitionMetadata())
+
+
+def _execute_sort_partition(
+    plan: SortExec, partition_id: int, shuffle_blocks: ShuffleBlocksByStage | None
+) -> Partition:
+    """Sort this one partition's rows by `plan.sort_exprs`/`plan.ascending`.
+
+    Like HashAggregateExec, this cannot stream: the whole partition must
+    be seen before any row's final position is known, so rows are
+    materialized up front. Multi-key, mixed ascending/descending order is
+    achieved with repeated stable sorts, last key first (Python's `sort`
+    is guaranteed stable, so an earlier pass's relative order survives
+    for rows that tie on a later, higher-priority key): a single
+    `sorted(key=...)` call sorting on a tuple of keys cannot vary
+    direction per key without either negating values (which breaks for
+    non-numeric types like strings) or a custom comparator (removed from
+    Python 3's `sorted`).
+
+    Nulls always sort last, regardless of ascending/descending: a
+    deliberate, documented simplification rather than implementing
+    per-column NULLS FIRST/LAST placement.
+    """
+    parent = execute_partition(plan.child, partition_id, shuffle_blocks)
+    rows = list(parent)
+    for expr, ascending in reversed(list(zip(plan.sort_exprs, plan.ascending, strict=True))):
+        key_fn = functools.partial(_null_last_sort_key, expr, ascending)
+        rows.sort(key=key_fn, reverse=not ascending)
+    return Partition(
+        partition_id,
+        plan.schema,
+        functools.partial(iter, rows),
+        PartitionMetadata(row_count=len(rows)),
+    )
+
+
+def _null_last_sort_key(expr: Expression, ascending: bool, record: Record) -> tuple[bool, object]:
+    value = expr.evaluate(record)
+    is_null = value is None
+    # `rows.sort(..., reverse=not ascending)` flips the *whole* key tuple,
+    # including whichever boolean marks a null, not just the value part.
+    # Pre-flipping the sentinel here (rather than always using `is_null`)
+    # is what keeps nulls sorting last in the final output for a
+    # descending column too, not only for an ascending one.
+    null_sentinel = is_null if ascending else not is_null
+    return (null_sentinel, value if not is_null else 0)
