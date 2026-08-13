@@ -41,8 +41,8 @@ from minispark.core.partition import Partition, PartitionMetadata
 from minispark.core.schema import Schema
 from minispark.execution.stages import Stage
 from minispark.execution.tasks import Task, TaskResult, TaskState
-from minispark.execution.worker import _leaf_node, execute_task
-from minispark.physical.plan import ShuffleReadExec, ShuffleWriteExec
+from minispark.execution.worker import execute_task
+from minispark.physical.plan import ShuffleReadExec, ShuffleWriteExec, leaves
 from minispark.shuffle.manager import ShuffleManager
 from minispark.shuffle.writer import ShuffleBlockMeta
 
@@ -105,8 +105,14 @@ class LocalScheduler:
     def _run_stage_tasks(
         self, stage: Stage, shuffle_manager: ShuffleManager, task_ids: itertools.count
     ) -> list[TaskResult]:
-        leaf = _leaf_node(stage.plan)
-        reads_from_stage = leaf.from_stage_id if isinstance(leaf, ShuffleReadExec) else None
+        # A stage's plan can read from more than one prior stage (a
+        # HashJoinExec-rooted stage has one ShuffleReadExec leaf per
+        # side). Each is resolved independently: a normal read fetches
+        # this task's own partition_id; a broadcast read (see
+        # physical/plan.py's ShuffleReadExec.is_broadcast) always fetches
+        # target partition 0, the same blocks for every task in this
+        # stage, regardless of that task's own partition_id.
+        read_leaves = [leaf for leaf in leaves(stage.plan) if isinstance(leaf, ShuffleReadExec)]
         tasks = [
             Task(
                 task_id=next(task_ids),
@@ -115,8 +121,13 @@ class LocalScheduler:
                 plan=stage.plan,
                 shuffle_root_dir=shuffle_manager.root_dir,
                 shuffle_blocks=(
-                    shuffle_manager.blocks_for(reads_from_stage, pid)
-                    if reads_from_stage is not None
+                    {
+                        leaf.from_stage_id: shuffle_manager.blocks_for(
+                            leaf.from_stage_id, 0 if leaf.is_broadcast else pid
+                        )
+                        for leaf in read_leaves
+                    }
+                    if read_leaves
                     else None
                 ),
             )
