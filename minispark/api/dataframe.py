@@ -24,7 +24,7 @@ from minispark.execution.stages import Stage, build_stages
 from minispark.expressions.base import Expression
 from minispark.expressions.column import Column
 from minispark.logical.analyzer import analyze
-from minispark.logical.nodes import Filter, LogicalPlan, Project
+from minispark.logical.nodes import Filter, Join, LogicalPlan, Project, Sort
 from minispark.logical.plan import explain_string
 from minispark.optimizer.optimizer import Optimizer, default_rules
 from minispark.physical.planner import plan_physical
@@ -64,6 +64,44 @@ class DataFrame:
             raise ValueError("group_by() requires at least one column")
         exprs = [Column(c) if isinstance(c, str) else c for c in columns]
         return GroupedData(self._session, self._plan, exprs)
+
+    def join(
+        self,
+        other: DataFrame,
+        on: str | list[str],
+        how: str = "inner",
+        broadcast: bool = False,
+    ) -> DataFrame:
+        """Inner equi-join on column name(s) present on both sides.
+
+        See logical/nodes.py's `Join` docstring for exactly what this does
+        and does not support (inner only, common-name `on=` only).
+        `broadcast=True` is an explicit hint (see physical/planner.py);
+        there is no automatic broadcast-vs-shuffle selection.
+        """
+        on_list = [on] if isinstance(on, str) else list(on)
+        if not on_list:
+            raise ValueError("join() requires at least one column in on=")
+        return DataFrame(
+            self._session, Join(self._plan, other._plan, on_list, how=how, broadcast=broadcast)
+        )
+
+    def order_by(
+        self, *columns: str | Expression, ascending: bool | list[bool] = True
+    ) -> DataFrame:
+        if not columns:
+            raise ValueError("order_by() requires at least one column")
+        exprs = [Column(c) if isinstance(c, str) else c for c in columns]
+        if isinstance(ascending, bool):
+            ascending_list = [ascending] * len(exprs)
+        else:
+            ascending_list = list(ascending)
+            if len(ascending_list) != len(exprs):
+                raise ValueError("ascending must be a single bool or one bool per column")
+        return DataFrame(self._session, Sort(self._plan, exprs, ascending_list))
+
+    # `sort` is the common alias for `order_by` (pandas/SQL-flavored naming).
+    sort = order_by
 
     # ---- actions (trigger analysis, optimization, and execution) ----------
     def _optimized_plan(self) -> LogicalPlan:
