@@ -2,11 +2,18 @@ import pytest
 
 from minispark.api.functions import col, lit
 from minispark.api.session import MiniSparkSession
+from minispark.execution.tasks import TaskResult, TaskState
 from minispark.logical.analyzer import AnalysisException
 
 
 def make_session():
-    return MiniSparkSession.builder.master("local[2]").app_name("test").get_or_create()
+    # local[1]: exercises the full Task/Stage/LocalScheduler path added in
+    # Milestone 3, but sequentially in this process, not through a real
+    # ProcessPoolExecutor. Keeps this file's routine correctness tests fast
+    # and free of OS-process-spawn overhead; real multiprocessing (local[N]
+    # with N > 1) gets its own dedicated tests in
+    # tests/integration/test_scheduler_multiprocessing.py.
+    return MiniSparkSession.builder.master("local[1]").app_name("test").get_or_create()
 
 
 def test_filter_select_collect_on_memory_data():
@@ -74,13 +81,18 @@ def test_show_prints_table(capsys):
 
 
 def test_no_execution_before_action(monkeypatch):
-    """filter()/select() must not analyze, optimize, plan, or execute anything."""
-    import minispark.physical.operators as physical_operators
+    """filter()/select() must not analyze, optimize, plan, schedule, or execute
+    anything. Patches the `execute_task` name inside execution/scheduler.py
+    (not execution/worker.py, where it is defined): scheduler.py imports it
+    with `from ... import execute_task`, which copies the reference into
+    its own module namespace, so that is the binding LocalScheduler
+    actually calls and the one that needs patching."""
+    import minispark.execution.scheduler as scheduler_module
 
-    def _fail(plan):
-        raise AssertionError("execute() should not run during plan construction")
+    def _fail(task, attempt_number=0):
+        raise AssertionError("execute_task() should not run during plan construction")
 
-    monkeypatch.setattr(physical_operators, "execute", _fail)
+    monkeypatch.setattr(scheduler_module, "execute_task", _fail)
     session = make_session()
     df = session.create_dataframe([{"a": 1}], num_partitions=1)
     df.filter(col("a") > 0).select("a")  # no .collect()/.show()/.count()
@@ -111,10 +123,41 @@ def test_explain_optimized_shows_analyzed_optimized_and_physical_sections(capsys
     assert "== Analyzed Logical Plan ==" in out
     assert "== Optimized Logical Plan ==" in out
     assert "== Physical Plan ==" in out
+    assert "== Stages ==" in out
     assert "ScanExec[" in out
+    assert "Stage 0 (1 partitions)" in out
     # constant folding should have collapsed "10 + 10" down to 20 by the
     # time the optimized plan is printed.
     assert "Literal(20)" in out
+
+
+def test_task_retry_recovers_from_a_transient_failure(monkeypatch):
+    """A task that fails once and succeeds on retry must still produce a
+    correct final result: proves LocalScheduler's retry loop end to end
+    through the real DataFrame path, not just that retry logic exists in
+    isolation (see tests/unit/test_scheduler.py for that)."""
+    import minispark.execution.scheduler as scheduler_module
+
+    real_execute_task = scheduler_module.execute_task
+    failed_once = False
+
+    def flaky(task, attempt_number=0):
+        nonlocal failed_once
+        if task.partition_id == 0 and not failed_once:
+            failed_once = True
+            return TaskResult(task_id=task.task_id, state=TaskState.FAILED, error="injected")
+        return real_execute_task(task, attempt_number)
+
+    monkeypatch.setattr(scheduler_module, "execute_task", flaky)
+
+    session = make_session()
+    df = session.create_dataframe(
+        [{"name": "alice", "age": 30}, {"name": "bob", "age": 17}], num_partitions=1
+    )
+    rows = df.filter(col("age") > 18).collect()
+
+    assert rows == [{"name": "alice", "age": 30}]
+    assert failed_once is True
 
 
 def test_optimization_does_not_change_query_results():
