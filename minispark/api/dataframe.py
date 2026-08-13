@@ -1,21 +1,22 @@
 """DataFrame: the lazy, user-facing query-building API.
 
-`filter()`/`select()` only build logical plan nodes — see `logical/nodes.py`
-— and never touch data. Only the action methods at the bottom of this file
-(`collect`, `show`, `count`, `explain`) trigger anything: analysis
-(`logical/analyzer.py`), optimization (`optimizer/optimizer.py`), physical
-planning (`physical/planner.py`), stage splitting (`execution/stages.py`),
-and scheduled execution (`execution/scheduler.py`'s `LocalScheduler`), in
-that order. Milestone 1's naive executor (`execution/executor.py`) and
-`physical/operators.py`'s whole-Dataset `execute()` are no longer on this
-path; both remain as correctness oracles other tests check the real path
-against.
+`filter()`/`select()`/`group_by()` only build logical plan nodes — see
+`logical/nodes.py` — and never touch data. Only the action methods at the
+bottom of this file (`collect`, `show`, `count`, `explain`) trigger
+anything: analysis (`logical/analyzer.py`), optimization
+(`optimizer/optimizer.py`), physical planning (`physical/planner.py`),
+stage splitting (`execution/stages.py`), and scheduled execution
+(`execution/scheduler.py`'s `LocalScheduler`), in that order. Milestone 1's
+naive executor (`execution/executor.py`) and `physical/operators.py`'s
+whole-Dataset `execute()` are no longer on this path; both remain as
+correctness oracles other tests check the real path against.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from minispark.api.grouped import GroupedData
 from minispark.core.record import Record
 from minispark.core.schema import Schema
 from minispark.execution.scheduler import LocalScheduler
@@ -58,29 +59,35 @@ class DataFrame:
         exprs = [Column(c) if isinstance(c, str) else c for c in columns]
         return DataFrame(self._session, Project(self._plan, exprs))
 
+    def group_by(self, *columns: str | Expression) -> GroupedData:
+        if not columns:
+            raise ValueError("group_by() requires at least one column")
+        exprs = [Column(c) if isinstance(c, str) else c for c in columns]
+        return GroupedData(self._session, self._plan, exprs)
+
     # ---- actions (trigger analysis, optimization, and execution) ----------
     def _optimized_plan(self) -> LogicalPlan:
         analyzed = analyze(self._plan)
         optimizer = Optimizer(default_rules(self._session.config.optimizer))
         return optimizer.optimize(analyzed)
 
-    def _stage(self) -> Stage:
-        physical = plan_physical(self._optimized_plan())
-        # Exactly one stage today: no physical node is wide yet (see
-        # execution/dag.py), so there is no shuffle boundary to split at.
-        (stage,) = build_stages(physical)
-        return stage
+    def _stages(self) -> list[Stage]:
+        physical = plan_physical(
+            self._optimized_plan(),
+            shuffle_partitions=self._session.config.execution.shuffle_partitions,
+        )
+        return build_stages(physical)
 
     def _scheduler(self) -> LocalScheduler:
         engine = self._session.config.engine
         return LocalScheduler(num_workers=engine.num_workers, max_retries=engine.max_task_retries)
 
     def collect(self) -> list[Record]:
-        dataset = self._scheduler().run_stage(self._stage())
+        dataset = self._scheduler().run_plan(self._stages())
         return list(dataset.iter_records())
 
     def count(self) -> int:
-        dataset = self._scheduler().run_stage(self._stage())
+        dataset = self._scheduler().run_plan(self._stages())
         return dataset.row_count()
 
     def show(self, n: int = 20) -> None:
@@ -113,12 +120,17 @@ class DataFrame:
         print()
         print("== Optimized Logical Plan ==")
         print(explain_string(optimized_plan))
-        physical = plan_physical(optimized_plan)
+        physical = plan_physical(
+            optimized_plan, shuffle_partitions=self._session.config.execution.shuffle_partitions
+        )
         print()
         print("== Physical Plan ==")
         print(explain_string(physical))
-        (stage,) = build_stages(physical)
+        stages = build_stages(physical)
         print()
         print("== Stages ==")
-        print(f"Stage {stage.stage_id} ({stage.num_partitions} partitions):")
-        print(explain_string(stage.plan))
+        for i, stage in enumerate(stages):
+            if i:
+                print()
+            print(f"Stage {stage.stage_id} ({stage.num_partitions} partitions):")
+            print(explain_string(stage.plan))
