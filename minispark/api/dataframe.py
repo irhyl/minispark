@@ -4,12 +4,12 @@
 — and never touch data. Only the action methods at the bottom of this file
 (`collect`, `show`, `count`, `explain`) trigger anything: analysis
 (`logical/analyzer.py`), optimization (`optimizer/optimizer.py`), physical
-planning (`physical/planner.py`), and physical execution
-(`physical/operators.py`), in that order. Milestone 1's naive executor
-(`execution/executor.py`) is no longer on this path; it remains as the
-correctness oracle physical execution is tested against. Milestone 3 will
-retarget the last step at a DAG/scheduler without changing this class's
-public surface.
+planning (`physical/planner.py`), stage splitting (`execution/stages.py`),
+and scheduled execution (`execution/scheduler.py`'s `LocalScheduler`), in
+that order. Milestone 1's naive executor (`execution/executor.py`) and
+`physical/operators.py`'s whole-Dataset `execute()` are no longer on this
+path; both remain as correctness oracles other tests check the real path
+against.
 """
 
 from __future__ import annotations
@@ -18,13 +18,14 @@ from typing import TYPE_CHECKING
 
 from minispark.core.record import Record
 from minispark.core.schema import Schema
+from minispark.execution.scheduler import LocalScheduler
+from minispark.execution.stages import Stage, build_stages
 from minispark.expressions.base import Expression
 from minispark.expressions.column import Column
 from minispark.logical.analyzer import analyze
 from minispark.logical.nodes import Filter, LogicalPlan, Project
 from minispark.logical.plan import explain_string
 from minispark.optimizer.optimizer import Optimizer, default_rules
-from minispark.physical import operators as physical_operators
 from minispark.physical.planner import plan_physical
 
 if TYPE_CHECKING:
@@ -63,14 +64,23 @@ class DataFrame:
         optimizer = Optimizer(default_rules(self._session.config.optimizer))
         return optimizer.optimize(analyzed)
 
-    def collect(self) -> list[Record]:
+    def _stage(self) -> Stage:
         physical = plan_physical(self._optimized_plan())
-        dataset = physical_operators.execute(physical)
+        # Exactly one stage today: no physical node is wide yet (see
+        # execution/dag.py), so there is no shuffle boundary to split at.
+        (stage,) = build_stages(physical)
+        return stage
+
+    def _scheduler(self) -> LocalScheduler:
+        engine = self._session.config.engine
+        return LocalScheduler(num_workers=engine.num_workers, max_retries=engine.max_task_retries)
+
+    def collect(self) -> list[Record]:
+        dataset = self._scheduler().run_stage(self._stage())
         return list(dataset.iter_records())
 
     def count(self) -> int:
-        physical = plan_physical(self._optimized_plan())
-        dataset = physical_operators.execute(physical)
+        dataset = self._scheduler().run_stage(self._stage())
         return dataset.row_count()
 
     def show(self, n: int = 20) -> None:
@@ -107,3 +117,8 @@ class DataFrame:
         print()
         print("== Physical Plan ==")
         print(explain_string(physical))
+        (stage,) = build_stages(physical)
+        print()
+        print("== Stages ==")
+        print(f"Stage {stage.stage_id} ({stage.num_partitions} partitions):")
+        print(explain_string(stage.plan))
