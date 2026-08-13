@@ -1,9 +1,10 @@
-"""LocalScheduler: turns a Stage into Tasks, runs them, retries failures,
-and merges results back into one Dataset.
+"""LocalScheduler: turns Stages into Tasks, runs them, retries failures,
+shuffles data between stages, and merges the last stage's results into
+one Dataset.
 
-`local[N]` selects how: `N == 1` runs tasks sequentially in this process
-(no multiprocessing overhead, still goes through the exact same Task ->
-TaskResult path as `N > 1`); `N > 1` runs tasks across a real
+`local[N]` selects how tasks run: `N == 1` runs them sequentially in this
+process (no multiprocessing overhead, still goes through the exact same
+Task -> TaskResult path as `N > 1`); `N > 1` runs them across a real
 `ProcessPoolExecutor`, actual OS processes, not threads (the build spec is
 explicit that threads are the wrong tool here because of the GIL). This is
 also why every Task and its PhysicalPlan had to become genuinely
@@ -16,11 +17,21 @@ Retries happen in this process, not inside a worker: `execute_task`
 TaskResult instead of raising, so "should this be retried" is always a
 plain decision this scheduler makes by inspecting a TaskResult, whether
 that result came back from a local call or from a pool worker.
+
+`run_plan()` runs a list of Stages *in order*: a stage that reads shuffle
+input cannot start until the stage that wrote it has fully finished (that
+is what a wide dependency means, see execution/dag.py), so stages are not
+pipelined or run concurrently with each other, only the tasks within one
+stage are. A stage whose plan is rooted at `ShuffleWriteExec` does not
+produce this query's final rows; its tasks' shuffle block metadata is
+registered into a `ShuffleManager` instead, so the next stage's tasks know
+what to read.
 """
 
 from __future__ import annotations
 
 import functools
+import itertools
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 
@@ -30,7 +41,10 @@ from minispark.core.partition import Partition, PartitionMetadata
 from minispark.core.schema import Schema
 from minispark.execution.stages import Stage
 from minispark.execution.tasks import Task, TaskResult, TaskState
-from minispark.execution.worker import execute_task
+from minispark.execution.worker import _leaf_node, execute_task
+from minispark.physical.plan import ShuffleReadExec, ShuffleWriteExec
+from minispark.shuffle.manager import ShuffleManager
+from minispark.shuffle.writer import ShuffleBlockMeta
 
 logger = get_logger("scheduler")
 
@@ -39,7 +53,7 @@ RunTaskFn = Callable[[Task, int], TaskResult]
 
 class TaskExecutionError(Exception):
     """A task exhausted its retries. No lineage-based recomputation exists
-    yet (Milestone 6); Milestone 3's failure handling stops at retry."""
+    yet (Milestone 6); failure handling stops at retry."""
 
 
 class LocalScheduler:
@@ -59,14 +73,59 @@ class LocalScheduler:
         self._run_task = run_task or execute_task
 
     def run_stage(self, stage: Stage) -> Dataset:
+        """Run a single stage. A thin wrapper around `run_plan([stage])`,
+        kept because a plan with no shuffle boundary (Scan/Filter/Project
+        only) is still exactly one stage, and callers/tests with a single
+        Stage in hand should not have to build a one-element list."""
+        return self.run_plan([stage])
+
+    def run_plan(self, stages: list[Stage]) -> Dataset:
+        shuffle_manager = ShuffleManager()
+        task_ids = itertools.count()
+        try:
+            final_dataset: Dataset | None = None
+            for stage in stages:
+                results = self._run_stage_tasks(stage, shuffle_manager, task_ids)
+                if isinstance(stage.plan, ShuffleWriteExec):
+                    blocks: list[ShuffleBlockMeta] = [
+                        b for r in results for b in r.shuffle_blocks
+                    ]
+                    shuffle_manager.register_blocks(stage.stage_id, blocks)
+                    logger.info(
+                        "ShuffleCompleted stage_id=%s blocks=%s", stage.stage_id, len(blocks)
+                    )
+                else:
+                    final_dataset = _results_to_dataset(stage.plan.schema, results)
+            if final_dataset is None:
+                raise AssertionError("run_plan() received no stages")
+            return final_dataset
+        finally:
+            shuffle_manager.cleanup()
+
+    def _run_stage_tasks(
+        self, stage: Stage, shuffle_manager: ShuffleManager, task_ids: itertools.count
+    ) -> list[TaskResult]:
+        leaf = _leaf_node(stage.plan)
+        reads_from_stage = leaf.from_stage_id if isinstance(leaf, ShuffleReadExec) else None
         tasks = [
-            Task(task_id=i, stage_id=stage.stage_id, partition_id=i, plan=stage.plan)
-            for i in range(stage.num_partitions)
+            Task(
+                task_id=next(task_ids),
+                stage_id=stage.stage_id,
+                partition_id=pid,
+                plan=stage.plan,
+                shuffle_root_dir=shuffle_manager.root_dir,
+                shuffle_blocks=(
+                    shuffle_manager.blocks_for(reads_from_stage, pid)
+                    if reads_from_stage is not None
+                    else None
+                ),
+            )
+            for pid in range(stage.num_partitions)
         ]
         logger.info("StageStarted stage_id=%s tasks=%s", stage.stage_id, len(tasks))
         results = self._run_to_completion(tasks)
         logger.info("StageCompleted stage_id=%s", stage.stage_id)
-        return _results_to_dataset(stage.plan.schema, results)
+        return results
 
     def _run_to_completion(self, tasks: list[Task]) -> list[TaskResult]:
         pending: dict[int, tuple[Task, int]] = {t.task_id: (t, 0) for t in tasks}
