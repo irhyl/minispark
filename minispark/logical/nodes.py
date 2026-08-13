@@ -92,11 +92,11 @@ class Project(LogicalPlan):
 
     @property
     def node_label(self) -> str:
-        cols = ", ".join(_output_name(c) for c in self.columns)
+        cols = ", ".join(output_name(c) for c in self.columns)
         return f"Project[{cols}]"
 
 
-def _output_name(expr: Expression) -> str:
+def output_name(expr: Expression) -> str:
     if isinstance(expr, Alias):
         return expr.name
     if isinstance(expr, Column):
@@ -105,13 +105,14 @@ def _output_name(expr: Expression) -> str:
 
 
 def _output_field(expr: Expression, child_schema: Schema) -> Field:
-    name = _output_name(expr)
+    name = output_name(expr)
     inner = expr.child if isinstance(expr, Alias) else expr
     if isinstance(inner, Column) and child_schema.has_field(inner.name):
         source_field = child_schema.get_field(inner.name)
         return Field(name, source_field.data_type, source_field.nullable)
-    # Computed expressions (arithmetic, etc.) have no static type inference
-    # in Milestone 1 — no analyzer exists yet to derive one. Default to
-    # STRING/nullable so schema propagation never crashes; Milestone 2's
-    # analyzer is expected to replace this with real type inference.
+    # Computed expressions (arithmetic, etc.) have no static type inference.
+    # The Milestone 2 analyzer validates that referenced columns exist, but
+    # does not yet infer result types for arithmetic; default to
+    # STRING/nullable so schema propagation never crashes. Real type
+    # inference is not implemented.
     return Field(name, STRING, nullable=True)
