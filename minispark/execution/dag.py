@@ -9,16 +9,20 @@ Two dependency classes, per the build spec:
     partition must finish and be written out before any wide-dependency
     task can start.
 
-`ScanExec`, `FilterExec`, `ProjectExec`, and `HashAggregateExec` are all
-narrow: even `HashAggregateExec` only groups rows *within* the one
-partition it is given (see physical/operators.py), it does not itself
-move data between partitions. `ExchangeExec` is the one wide node: it is
-exactly the marker the physical planner leaves at a shuffle boundary
-(Aggregate's partial-aggregate-then-shuffle-then-final-aggregate shape,
-see physical/planner.py). `ShuffleWriteExec`/`ShuffleReadExec` (the
-post-stage-split rewrite of an `ExchangeExec`, see stages.py) are narrow
-again: by the time either exists, the wide dependency they came from has
-already been resolved into two separate stages.
+`ScanExec`, `FilterExec`, `ProjectExec`, `HashAggregateExec`,
+`HashJoinExec`, and `SortExec` are all narrow: even `SortExec` only sorts
+the rows *within* the one partition it is given (see
+physical/operators.py); the ordering it produces is only locally correct
+until the shuffle around it has moved rows into the right target
+partitions. `ExchangeExec` is the one wide node: it is exactly the marker
+the physical planner leaves at a shuffle boundary (Aggregate's
+partial-aggregate-then-shuffle-then-final-aggregate shape, a
+HashJoinExec's shuffled or broadcast side, or order_by()'s local-sort-
+then-range-shuffle-then-final-sort shape, see physical/planner.py).
+`ShuffleWriteExec`/`ShuffleReadExec` (the post-stage-split rewrite of an
+`ExchangeExec`, see stages.py) are narrow again: by the time either
+exists, the wide dependency they came from has already been resolved
+into two separate stages.
 """
 
 from __future__ import annotations
@@ -30,11 +34,13 @@ from minispark.physical.plan import (
     ExchangeExec,
     FilterExec,
     HashAggregateExec,
+    HashJoinExec,
     PhysicalPlan,
     ProjectExec,
     ScanExec,
     ShuffleReadExec,
     ShuffleWriteExec,
+    SortExec,
 )
 
 _NARROW_NODE_TYPES = (
@@ -42,6 +48,8 @@ _NARROW_NODE_TYPES = (
     FilterExec,
     ProjectExec,
     HashAggregateExec,
+    HashJoinExec,
+    SortExec,
     ShuffleWriteExec,
     ShuffleReadExec,
 )
