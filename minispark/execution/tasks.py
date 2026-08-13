@@ -11,11 +11,14 @@ sequentially as stages run, since a task in a later stage needs an id
 distinct from every task in every earlier stage.
 
 Two fields only matter for a task whose stage reads shuffle input (its
-plan contains a `ShuffleReadExec`, see execution/stages.py):
-`shuffle_root_dir` (where every block for this query was written) and
-`shuffle_blocks` (exactly the blocks this task's partition needs to read,
-already filtered driver-side by `shuffle/manager.py`'s `ShuffleManager`).
-Both are `None` for a task whose stage does not read shuffle input.
+plan contains one or more `ShuffleReadExec` leaves, see
+execution/stages.py): `shuffle_root_dir` (where every block for this
+query was written) and `shuffle_blocks` (keyed by source stage_id: a
+`HashJoinExec`-rooted stage reads from two prior stages, one per side, so
+this is a mapping, not a single flat list; each entry is exactly the
+blocks that stage's data contributes to this task's partition, already
+filtered driver-side by `shuffle/manager.py`'s `ShuffleManager`). Both
+are `None` for a task whose stage does not read shuffle input.
 """
 
 from __future__ import annotations
@@ -26,6 +29,8 @@ from enum import Enum, auto
 from minispark.core.record import Record
 from minispark.physical.plan import PhysicalPlan
 from minispark.shuffle.writer import ShuffleBlockMeta
+
+ShuffleBlocksByStage = dict[int, list[ShuffleBlockMeta]]
 
 
 class TaskState(Enum):
@@ -44,7 +49,7 @@ class Task:
     partition_id: int
     plan: PhysicalPlan
     shuffle_root_dir: str | None = None
-    shuffle_blocks: list[ShuffleBlockMeta] | None = None
+    shuffle_blocks: ShuffleBlocksByStage | None = None
 
 
 @dataclass(frozen=True)
