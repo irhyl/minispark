@@ -1,10 +1,8 @@
-"""Logical plan nodes: Scan, Filter, Project.
+"""Logical plan nodes: Scan, Filter, Project, Aggregate.
 
-Only these three exist in Milestone 1 (per the build prompt's explicit
-scope). Aggregate, Join, Sort, Limit, Union, Repartition, Distinct are
-listed in the target architecture but are added alongside the milestones
-that give them meaning (Aggregate in Milestone 4, Join/Sort in Milestone
-5, etc.) rather than stubbed out empty now.
+Join, Sort, Limit, Union, Repartition, Distinct are listed in the target
+architecture but are added alongside the milestones that give them meaning
+(Join/Sort in Milestone 5, etc.) rather than stubbed out empty now.
 """
 
 from __future__ import annotations
@@ -13,7 +11,8 @@ from abc import ABC, abstractmethod
 
 from minispark.core.dataset import Dataset
 from minispark.core.schema import Field, Schema
-from minispark.core.types import STRING
+from minispark.core.types import STRING, DataType
+from minispark.expressions.aggregate import AggregateFunction
 from minispark.expressions.base import Alias, Expression
 from minispark.expressions.column import Column
 
@@ -96,6 +95,45 @@ class Project(LogicalPlan):
         return f"Project[{cols}]"
 
 
+class Aggregate(LogicalPlan):
+    """Groups `child`'s rows by `group_by`, computing `aggregates` per group.
+
+    `group_by` entries must be plain `Column` expressions (grouping by a
+    computed expression is not supported): the group key is evaluated per
+    row as the shuffle-partitioning key (see physical/planner.py and
+    shuffle/partitioner.py), so it needs to be something meaningful to
+    hash, not an arbitrary expression tree. `aggregates` holds
+    `AggregateFunction` expressions, optionally wrapped in `Alias` for
+    output naming (e.g. `count("*").alias("users")`).
+    """
+
+    def __init__(
+        self,
+        child: LogicalPlan,
+        group_by: list[Expression],
+        aggregates: list[Expression],
+    ):
+        self.child = child
+        self.group_by = group_by
+        self.aggregates = aggregates
+
+    @property
+    def schema(self) -> Schema:
+        group_fields = [_output_field(g, self.child.schema) for g in self.group_by]
+        agg_fields = [_aggregate_output_field(a, self.child.schema) for a in self.aggregates]
+        return Schema(group_fields + agg_fields)
+
+    @property
+    def children(self) -> list[LogicalPlan]:
+        return [self.child]
+
+    @property
+    def node_label(self) -> str:
+        group_cols = ", ".join(output_name(g) for g in self.group_by)
+        agg_cols = ", ".join(output_name(a) for a in self.aggregates)
+        return f"Aggregate[groupBy=({group_cols}), aggregates=({agg_cols})]"
+
+
 def output_name(expr: Expression) -> str:
     if isinstance(expr, Alias):
         return expr.name
@@ -116,3 +154,23 @@ def _output_field(expr: Expression, child_schema: Schema) -> Field:
     # STRING/nullable so schema propagation never crashes. Real type
     # inference is not implemented.
     return Field(name, STRING, nullable=True)
+
+
+def _infer_child_type(expr: Expression, schema: Schema) -> DataType:
+    """The DataType `expr` would produce, if it is a plain Column lookup.
+
+    Same fallback as `_output_field`: a computed (non-Column) expression
+    defaults to STRING rather than attempting real type inference.
+    """
+    if isinstance(expr, Column) and schema.has_field(expr.name):
+        return schema.get_field(expr.name).data_type
+    return STRING
+
+
+def _aggregate_output_field(expr: Expression, child_schema: Schema) -> Field:
+    name = output_name(expr)
+    inner = expr.child if isinstance(expr, Alias) else expr
+    if not isinstance(inner, AggregateFunction):
+        raise ValueError(f"Expected an aggregate expression, got {expr!r}")
+    child_type = _infer_child_type(inner.child, child_schema) if inner.child is not None else STRING
+    return Field(name, inner.result_type(child_type), nullable=True)
