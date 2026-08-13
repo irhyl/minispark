@@ -2,11 +2,12 @@
 
 Mirrors the shape sketched in the build prompt (engine/execution/memory/
 optimizer sections) so later milestones can add fields without restructuring.
-Milestone-1 reality check: only `engine.master` is read anywhere right now
-(by MiniSparkSession, purely for display/storage), because there is no
-scheduler, optimizer, or memory manager yet to consume the rest of these
-values. They exist now so each subsystem introduced later has a config
-home from day one instead of hardcoded constants.
+Reality check, as of Milestone 3: `engine.master` (via `num_workers`) and
+`engine.max_task_retries` are read by `execution/scheduler.py`'s
+`LocalScheduler`; `optimizer.predicate_pushdown` and
+`optimizer.projection_pruning` are read by `optimizer/optimizer.py`'s
+`default_rules()`. `execution` and `memory` are still unread, waiting on
+the shuffle/spill machinery that will consume them.
 
 YAML loading (the build prompt's example config file) is intentionally not
 implemented yet: it would be a config *format* with no config *consumers*
@@ -26,13 +27,17 @@ class EngineConfig:
 
     @property
     def num_workers(self) -> int:
-        """Parse 'local[N]' / 'local' into a worker count. Not yet consumed
-        by anything — no local scheduler exists until Milestone 3."""
+        """Parse 'local[N]' / 'local' into a worker count.
+
+        Read by `execution/scheduler.py`'s `LocalScheduler`: `N == 1`
+        runs tasks sequentially in-process, `N > 1` runs them across a
+        real `ProcessPoolExecutor`.
+        """
         if self.master == "local":
             return 1
         if self.master.startswith("local[") and self.master.endswith("]"):
             return int(self.master[len("local[") : -1])
-        raise ValueError(f"Unsupported master: {self.master!r} (only 'local[N]' in Milestone 1)")
+        raise ValueError(f"Unsupported master: {self.master!r} (only 'local[N]' is supported)")
 
 
 @dataclass
