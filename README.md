@@ -8,7 +8,7 @@ Spark replacement, and no performance claim in this repository is made without
 an accompanying, reproducible benchmark (see `docs/benchmarks.md`, added once
 there is something real to measure).
 
-## Status: Milestone 2
+## Status: Milestone 3
 
 Implemented so far:
 
@@ -43,13 +43,26 @@ Implemented so far:
   only things that trigger analysis, optimization, and execution.
   `explain(optimized=True)` shows the analyzed, optimized, and physical
   plans.
-- **Naive executor** (`minispark/execution/executor.py`): Milestone 1's
-  single-process, tree-walking interpreter of the logical plan. No longer
-  on the `DataFrame` action path; retained as the correctness oracle
-  physical execution is tested against.
+- **DAG, stages, and tasks** (`minispark/execution/dag.py`,
+  `stages.py`, `tasks.py`): classifies every physical node's dependency
+  as narrow or wide (all narrow so far), splits a physical plan into
+  stages at wide-dependency boundaries (always exactly one stage today,
+  no physical node is wide until Milestone 4), and represents one
+  partition's worth of work as a `Task`.
+- **Local scheduler** (`minispark/execution/scheduler.py`,
+  `worker.py`): `LocalScheduler` turns a stage into tasks and runs them,
+  either sequentially (`local[1]`) or across a real
+  `ProcessPoolExecutor` (`local[N>1]`, actual OS processes, not
+  threads), retries individual failed tasks up to
+  `engine.max_task_retries`, and merges results back into a `Dataset`.
+  `DataFrame` actions run through this scheduler as of Milestone 3.
+- **Naive executor** (`minispark/execution/executor.py`) and
+  `physical/operators.py`'s whole-Dataset `execute()`: earlier
+  milestones' execution paths, kept only as correctness oracles other
+  tests check the real path against.
 
-Not implemented yet (by design, not oversight): DAG/stage/task scheduling,
-shuffle, joins, aggregations, fault tolerance, checkpointing, columnar
+Not implemented yet (by design, not oversight): shuffle, joins,
+aggregations, lineage-based fault recovery, checkpointing, columnar
 execution, SQL, and benchmarking. Every one of those has a numbered section
 in the build spec this project follows and lands in its own milestone.
 
@@ -76,11 +89,11 @@ result.show()
 
 ## Architecture
 
-See `docs/architecture.md` for the layered design and why each layer exists,
-and `docs/query-planning.md` for how a DataFrame call currently gets from a
-logical plan to rows (analyzer, optimizer, physical plan). `docs/execution-
-model.md` (DAG/stage/task/worker/scheduler) is added once Milestone 3 gives
-it something real to describe.
+See `docs/architecture.md` for the layered design and why each layer
+exists, `docs/query-planning.md` for how a DataFrame call gets from a
+logical plan to a physical plan (analyzer, optimizer, physical plan), and
+`docs/execution-model.md` for how that physical plan actually runs
+(DAG, stages, tasks, the local scheduler, and what `local[N]` really does).
 
 ## Development
 
