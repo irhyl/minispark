@@ -30,6 +30,18 @@ class Expression(ABC):
         planner exists.
         """
 
+    @property
+    def children(self) -> list[Expression]:
+        """Direct child expressions, for generic tree walking.
+
+        Defaults to no children (Column, Literal). Subclasses with children
+        (BinaryExpression, Alias, Not, IsNull, IsNotNull) override this.
+        Added in Milestone 2 so the analyzer (column existence checks) and
+        the optimizer (constant folding, predicate pushdown) can walk any
+        expression tree without an isinstance chain over every node type.
+        """
+        return []
+
     def alias(self, name: str) -> Alias:
         return Alias(self, name)
 
@@ -136,6 +148,10 @@ class Alias(Expression):
 
     def evaluate(self, record: Record) -> Any:
         return self.child.evaluate(record)
+
+    @property
+    def children(self) -> list[Expression]:
+        return [self.child]
 
     def __repr__(self) -> str:
         return f"Alias({self.child!r}, {self.name!r})"
