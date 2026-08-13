@@ -1,4 +1,4 @@
-"""Milestone 1/2 end-to-end example.
+"""Milestone 1/2/3 end-to-end example.
 
 Reads a small CSV, selects then filters, and shows the result. select()
 before filter() and a foldable arithmetic expression are chosen on purpose
@@ -6,7 +6,13 @@ here (rather than the equivalent filter().select()) so that
 `explain(optimized=True)` has something to show: constant folding collapses
 `10 + 8` to `18`, predicate pushdown moves the filter below the select, and
 projection pruning drops "country" (selected nowhere, filtered on nowhere)
-right after the scan. Run with:
+right after the scan.
+
+`local[4]` means every action below (`explain(optimized=True)`'s physical
+plan, `show()`, `count()`) actually runs its one stage's tasks across a
+real 4-process `ProcessPoolExecutor` (see execution/scheduler.py), not a
+simulated stand-in; watch for the `StageStarted`/`StageCompleted` log
+lines this produces. Run with:
 
     python examples/basic_dataframe.py
 """
