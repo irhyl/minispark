@@ -25,7 +25,7 @@ from minispark.expressions.column import Column
 from minispark.expressions.literal import Literal
 from minispark.expressions.predicates import IsNotNull, IsNull, Not
 from minispark.logical.analyzer import referenced_columns
-from minispark.logical.nodes import Filter, LogicalPlan, Project, Scan
+from minispark.logical.nodes import Aggregate, Filter, LogicalPlan, Project, Scan
 
 
 class Rule(ABC):
@@ -37,12 +37,18 @@ class Rule(ABC):
 
 
 def map_expressions(plan: LogicalPlan, fn: Callable[[Expression], Expression]) -> LogicalPlan:
-    """Rebuild `plan`, applying `fn` to every Filter condition and Project column.
+    """Rebuild `plan`, applying `fn` to every expression it holds (Filter's
+    condition, Project's columns, Aggregate's group_by and aggregates).
 
-    Isinstance dispatch over the three Milestone 1/2 node types, matching
-    the style already used in execution/executor.py. A generic visitor
-    abstraction is not worth it yet for three node types; revisit once
-    Aggregate/Join/Sort land and the branch count grows.
+    Isinstance dispatch over the four node types that exist, matching the
+    style already used in execution/executor.py. A generic visitor
+    abstraction is not worth it yet for four node types; revisit once
+    Join/Sort land and the branch count grows. `fn` is not applied inside
+    an AggregateFunction's own child expression (e.g. `sum(age + 0)`'s
+    `age + 0`): neither `_fold` nor `_simplify_bool` below has a case for
+    AggregateFunction, so it is returned unchanged rather than recursed
+    into; that leaves a foldable expression un-folded inside an aggregate,
+    a missed optimization, not a correctness problem.
     """
     if isinstance(plan, Scan):
         return plan
@@ -50,6 +56,12 @@ def map_expressions(plan: LogicalPlan, fn: Callable[[Expression], Expression]) -
         return Filter(map_expressions(plan.child, fn), fn(plan.condition))
     if isinstance(plan, Project):
         return Project(map_expressions(plan.child, fn), [fn(c) for c in plan.columns])
+    if isinstance(plan, Aggregate):
+        return Aggregate(
+            map_expressions(plan.child, fn),
+            [fn(g) for g in plan.group_by],
+            [fn(a) for a in plan.aggregates],
+        )
     raise NotImplementedError(f"map_expressions has no rule for logical node {type(plan).__name__}")
 
 
@@ -173,6 +185,15 @@ def _pushdown(plan: LogicalPlan) -> LogicalPlan:
         return plan
     if isinstance(plan, Project):
         return Project(_pushdown(plan.child), plan.columns)
+    if isinstance(plan, Aggregate):
+        # A Filter above an Aggregate filters *aggregated* results (a
+        # HAVING clause, semantically); it cannot be pushed through the
+        # Aggregate into pre-aggregation rows without changing what it
+        # means. The isinstance(new_child, Project) check below already
+        # never matches an Aggregate, so no swap happens here regardless;
+        # this branch only makes _pushdown able to recurse past Aggregate
+        # at all.
+        return Aggregate(_pushdown(plan.child), plan.group_by, plan.aggregates)
     if isinstance(plan, Filter):
         new_child = _pushdown(plan.child)
         if isinstance(new_child, Project):
@@ -238,6 +259,18 @@ def _prune(plan: LogicalPlan, needed: set[str] | None) -> LogicalPlan:
         for expr in plan.columns:
             proj_cols |= referenced_columns(expr)
         return Project(_prune(plan.child, proj_cols), plan.columns)
+    if isinstance(plan, Aggregate):
+        # Like Project, an Aggregate fully determines what it needs from
+        # its child (group_by columns plus every aggregate's own child
+        # column): nothing above an Aggregate can reach a column that
+        # is not one of its own outputs, so `needed` from above does not
+        # apply to the child side and is replaced, not merged.
+        agg_cols: set[str] = set()
+        for g in plan.group_by:
+            agg_cols |= referenced_columns(g)
+        for a in plan.aggregates:
+            agg_cols |= referenced_columns(a)
+        return Aggregate(_prune(plan.child, agg_cols), plan.group_by, plan.aggregates)
     raise NotImplementedError(
         f"ProjectionPruning has no rule for logical node {type(plan).__name__}"
     )
@@ -290,6 +323,8 @@ def _eliminate(plan: LogicalPlan) -> LogicalPlan:
         return plan
     if isinstance(plan, Filter):
         return Filter(_eliminate(plan.child), plan.condition)
+    if isinstance(plan, Aggregate):
+        return Aggregate(_eliminate(plan.child), plan.group_by, plan.aggregates)
     if isinstance(plan, Project):
         new_child = _eliminate(plan.child)
         if _is_plain_column_projection(plan):
