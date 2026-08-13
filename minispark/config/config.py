@@ -2,12 +2,14 @@
 
 Mirrors the shape sketched in the build prompt (engine/execution/memory/
 optimizer sections) so later milestones can add fields without restructuring.
-Reality check, as of Milestone 3: `engine.master` (via `num_workers`) and
+Reality check, as of Milestone 4: `engine.master` (via `num_workers`) and
 `engine.max_task_retries` are read by `execution/scheduler.py`'s
 `LocalScheduler`; `optimizer.predicate_pushdown` and
 `optimizer.projection_pruning` are read by `optimizer/optimizer.py`'s
-`default_rules()`. `execution` and `memory` are still unread, waiting on
-the shuffle/spill machinery that will consume them.
+`default_rules()`; `execution.shuffle_partitions` is read by
+`physical/planner.py` when translating an Aggregate (how many reduce-side
+partitions a shuffle fans out to). `execution.partition_size_mb`,
+`execution.shuffle_compression`, and `memory` are still unread.
 
 YAML loading (the build prompt's example config file) is intentionally not
 implemented yet: it would be a config *format* with no config *consumers*
@@ -44,6 +46,7 @@ class EngineConfig:
 class ExecutionConfig:
     partition_size_mb: int = 128
     shuffle_compression: bool = True
+    shuffle_partitions: int = 4
 
 
 @dataclass
