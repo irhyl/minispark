@@ -25,7 +25,7 @@ from minispark.expressions.column import Column
 from minispark.expressions.literal import Literal
 from minispark.expressions.predicates import IsNotNull, IsNull, Not
 from minispark.logical.analyzer import referenced_columns
-from minispark.logical.nodes import Aggregate, Filter, LogicalPlan, Project, Scan
+from minispark.logical.nodes import Aggregate, Filter, Join, LogicalPlan, Project, Scan, Sort
 
 
 class Rule(ABC):
@@ -40,15 +40,15 @@ def map_expressions(plan: LogicalPlan, fn: Callable[[Expression], Expression]) -
     """Rebuild `plan`, applying `fn` to every expression it holds (Filter's
     condition, Project's columns, Aggregate's group_by and aggregates).
 
-    Isinstance dispatch over the four node types that exist, matching the
-    style already used in execution/executor.py. A generic visitor
-    abstraction is not worth it yet for four node types; revisit once
-    Join/Sort land and the branch count grows. `fn` is not applied inside
-    an AggregateFunction's own child expression (e.g. `sum(age + 0)`'s
-    `age + 0`): neither `_fold` nor `_simplify_bool` below has a case for
-    AggregateFunction, so it is returned unchanged rather than recursed
-    into; that leaves a foldable expression un-folded inside an aggregate,
-    a missed optimization, not a correctness problem.
+    Isinstance dispatch over the node types that exist, matching the style
+    already used in execution/executor.py. A generic visitor abstraction
+    is not worth it yet for six node types; revisit if the branch count
+    keeps growing. `fn` is not applied inside an AggregateFunction's own
+    child expression (e.g. `sum(age + 0)`'s `age + 0`): neither `_fold`
+    nor `_simplify_bool` below has a case for AggregateFunction, so it is
+    returned unchanged rather than recursed into; that leaves a foldable
+    expression un-folded inside an aggregate, a missed optimization, not a
+    correctness problem.
     """
     if isinstance(plan, Scan):
         return plan
@@ -61,6 +61,18 @@ def map_expressions(plan: LogicalPlan, fn: Callable[[Expression], Expression]) -
             map_expressions(plan.child, fn),
             [fn(g) for g in plan.group_by],
             [fn(a) for a in plan.aggregates],
+        )
+    if isinstance(plan, Join):
+        return Join(
+            map_expressions(plan.left, fn),
+            map_expressions(plan.right, fn),
+            plan.on,
+            plan.how,
+            plan.broadcast,
+        )
+    if isinstance(plan, Sort):
+        return Sort(
+            map_expressions(plan.child, fn), [fn(e) for e in plan.sort_exprs], plan.ascending
         )
     raise NotImplementedError(f"map_expressions has no rule for logical node {type(plan).__name__}")
 
@@ -158,7 +170,8 @@ class FilterSimplification(Rule):
 
 
 class PredicatePushdown(Rule):
-    """Push a Filter below a Project when the filter does not need the Project.
+    """Push a Filter below a Project when the filter does not need the
+    Project, and below a Join into whichever side it exclusively needs.
 
     `df.select("name", "age").filter(col("age") > 18)` builds
     `Filter(Project(Scan, [name, age]), age > 18)`. Filtering after
@@ -168,10 +181,15 @@ class PredicatePushdown(Rule):
     `Project(Filter(Scan, age > 18), [name, age])` instead: rows are
     dropped before the (comparatively cheap, here) projection work runs.
 
-    There is no Join node yet (Milestone 4/5), so this cannot yet push a
-    filter through a join to a specific side, which is the textbook
-    predicate-pushdown example. Pushing a Filter below a Project is the
-    meaningful instance of the same idea available with today's node set.
+    The Join case is the textbook predicate-pushdown example:
+    `Filter(Join(left, right, on), cond)` becomes
+    `Join(Filter(left, cond), right, on)` when `cond` only references
+    left's columns (or the symmetric case for right). This is only valid
+    because `Join.how` is always `"inner"` (see logical/nodes.py's `Join`
+    docstring): pushing a filter into one side of an outer join can drop
+    rows the join's null-padding semantics would otherwise have kept, so
+    this rule would need to check `how` before doing this if outer joins
+    existed.
     """
 
     name = "PredicatePushdown"
@@ -194,6 +212,12 @@ def _pushdown(plan: LogicalPlan) -> LogicalPlan:
         # this branch only makes _pushdown able to recurse past Aggregate
         # at all.
         return Aggregate(_pushdown(plan.child), plan.group_by, plan.aggregates)
+    if isinstance(plan, Join):
+        return Join(
+            _pushdown(plan.left), _pushdown(plan.right), plan.on, plan.how, plan.broadcast
+        )
+    if isinstance(plan, Sort):
+        return Sort(_pushdown(plan.child), plan.sort_exprs, plan.ascending)
     if isinstance(plan, Filter):
         new_child = _pushdown(plan.child)
         if isinstance(new_child, Project):
@@ -201,6 +225,26 @@ def _pushdown(plan: LogicalPlan) -> LogicalPlan:
             available = set(new_child.child.schema.field_names())
             if needed <= available:
                 return Project(Filter(new_child.child, plan.condition), new_child.columns)
+        if isinstance(new_child, Join):
+            needed = referenced_columns(plan.condition)
+            left_fields = set(new_child.left.schema.field_names())
+            right_fields = set(new_child.right.schema.field_names())
+            if needed <= left_fields:
+                return Join(
+                    Filter(new_child.left, plan.condition),
+                    new_child.right,
+                    new_child.on,
+                    new_child.how,
+                    new_child.broadcast,
+                )
+            if needed <= right_fields:
+                return Join(
+                    new_child.left,
+                    Filter(new_child.right, plan.condition),
+                    new_child.on,
+                    new_child.how,
+                    new_child.broadcast,
+                )
         return Filter(new_child, plan.condition)
     raise NotImplementedError(
         f"PredicatePushdown has no rule for logical node {type(plan).__name__}"
@@ -271,6 +315,36 @@ def _prune(plan: LogicalPlan, needed: set[str] | None) -> LogicalPlan:
         for a in plan.aggregates:
             agg_cols |= referenced_columns(a)
         return Aggregate(_prune(plan.child, agg_cols), plan.group_by, plan.aggregates)
+    if isinstance(plan, Join):
+        # Also a replace, like Aggregate: a Join's own output only ever
+        # contains left's and right's columns (minus right's `on`
+        # duplicates), so `needed` from above is split by which side each
+        # name belongs to, plus the `on` columns, which the join itself
+        # needs from both sides regardless of what is needed above it.
+        on_set = set(plan.on)
+        left_fields = set(plan.left.schema.field_names())
+        right_fields = set(plan.right.schema.field_names())
+        if needed is None:
+            left_needed, right_needed = left_fields, right_fields
+        else:
+            left_needed = (needed & left_fields) | on_set
+            right_needed = (needed & right_fields) | on_set
+        return Join(
+            _prune(plan.left, left_needed),
+            _prune(plan.right, right_needed),
+            plan.on,
+            plan.how,
+            plan.broadcast,
+        )
+    if isinstance(plan, Sort):
+        # Like Filter: Sort does not change which columns exist, only
+        # their order, so it adds its own sort-key columns to whatever
+        # was already required rather than replacing it.
+        sort_cols: set[str] = set()
+        for e in plan.sort_exprs:
+            sort_cols |= referenced_columns(e)
+        child_needed = None if needed is None else (needed | sort_cols)
+        return Sort(_prune(plan.child, child_needed), plan.sort_exprs, plan.ascending)
     raise NotImplementedError(
         f"ProjectionPruning has no rule for logical node {type(plan).__name__}"
     )
@@ -325,6 +399,12 @@ def _eliminate(plan: LogicalPlan) -> LogicalPlan:
         return Filter(_eliminate(plan.child), plan.condition)
     if isinstance(plan, Aggregate):
         return Aggregate(_eliminate(plan.child), plan.group_by, plan.aggregates)
+    if isinstance(plan, Join):
+        return Join(
+            _eliminate(plan.left), _eliminate(plan.right), plan.on, plan.how, plan.broadcast
+        )
+    if isinstance(plan, Sort):
+        return Sort(_eliminate(plan.child), plan.sort_exprs, plan.ascending)
     if isinstance(plan, Project):
         new_child = _eliminate(plan.child)
         if _is_plain_column_projection(plan):
