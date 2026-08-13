@@ -28,13 +28,24 @@ goes through the normal `execute_partition` -> rows path.
 
 from __future__ import annotations
 
+import functools
 import sys
 import time
+from collections.abc import Callable
+from typing import Any
 
+from minispark.core.record import Record
 from minispark.execution.tasks import Task, TaskContext, TaskMetrics, TaskResult, TaskState
+from minispark.expressions.base import Expression
 from minispark.physical.operators import execute_partition
-from minispark.physical.plan import PhysicalPlan, ScanExec, ShuffleReadExec, ShuffleWriteExec
-from minispark.shuffle.partitioner import HashPartitioner
+from minispark.physical.plan import (
+    PhysicalPlan,
+    ScanExec,
+    ShuffleReadExec,
+    ShuffleWriteExec,
+    leaves,
+)
+from minispark.shuffle.partitioner import HashPartitioner, Partitioner, RangePartitioner
 from minispark.shuffle.writer import write_shuffle_partition
 
 
@@ -87,9 +98,20 @@ def _execute_shuffle_write_task(task: Task) -> TaskResult:
     parent = execute_partition(write_exec.child, task.partition_id, task.shuffle_blocks)
     rows = list(parent)
     partition_exprs = write_exec.partition_exprs
+    partitioner: Partitioner
+    key_fn: Callable[[Record], Any]
 
-    def key_fn(record: dict) -> tuple:
-        return tuple(expr.evaluate(record) for expr in partition_exprs)
+    if write_exec.range_boundaries is not None:
+        # A range exchange (order_by(), see physical/planner.py) always
+        # has exactly one partition expression (the primary sort key);
+        # RangePartitioner.partition_for() compares a single scalar
+        # against the boundary list, not a tuple.
+        (sort_key_expr,) = partition_exprs
+        key_fn = functools.partial(_scalar_key, sort_key_expr)
+        partitioner = RangePartitioner(write_exec.num_partitions, write_exec.range_boundaries)
+    else:
+        key_fn = functools.partial(_tuple_key, partition_exprs)
+        partitioner = HashPartitioner(write_exec.num_partitions)
 
     blocks = write_shuffle_partition(
         root_dir=task.shuffle_root_dir,
@@ -97,7 +119,7 @@ def _execute_shuffle_write_task(task: Task) -> TaskResult:
         source_task_id=task.task_id,
         records=rows,
         key_fn=key_fn,
-        partitioner=HashPartitioner(write_exec.num_partitions),
+        partitioner=partitioner,
     )
     metrics = TaskMetrics(
         input_records=_input_record_count(task),
@@ -115,31 +137,48 @@ def _execute_shuffle_write_task(task: Task) -> TaskResult:
 
 
 def _input_record_count(task: Task) -> int | None:
-    """The source partition's row count, read from cheap, already-known
-    information rather than by scanning: Partition metadata for a Scan
-    leaf (populated by CSVDataSource/MemoryDataSource), or the shuffle
-    block metadata's record counts for a ShuffleReadExec leaf (already
-    known from the write side, see shuffle/writer.py). Returns None if
-    neither source knows.
+    """The total row count across every leaf this task's plan reads from,
+    from cheap, already-known information rather than by scanning:
+    Partition metadata for a ScanExec leaf (populated by
+    CSVDataSource/MemoryDataSource), or shuffle block metadata's record
+    counts for a ShuffleReadExec leaf (already known from the write side,
+    see shuffle/writer.py). A stage's plan can have more than one leaf
+    (a HashJoinExec-rooted stage has two, one per side); this sums across
+    all of them. Returns None only if no leaf's count is known.
     """
-    leaf = _leaf_node(task.plan)
+    counts = [_leaf_record_count(leaf, task) for leaf in leaves(task.plan)]
+    known = [c for c in counts if c is not None]
+    return sum(known) if known else None
+
+
+def _leaf_record_count(leaf: PhysicalPlan, task: Task) -> int | None:
     if isinstance(leaf, ScanExec):
         return leaf.dataset.partition(task.partition_id).row_count()
     if isinstance(leaf, ShuffleReadExec) and task.shuffle_blocks is not None:
-        return sum(b.record_count for b in task.shuffle_blocks)
+        blocks = task.shuffle_blocks.get(leaf.from_stage_id)
+        if blocks is not None:
+            return sum(b.record_count for b in blocks)
     return None
 
 
 def _shuffle_read_bytes(task: Task) -> int:
-    if isinstance(_leaf_node(task.plan), ShuffleReadExec) and task.shuffle_blocks is not None:
-        return sum(b.byte_length for b in task.shuffle_blocks)
-    return 0
+    if task.shuffle_blocks is None:
+        return 0
+    total = 0
+    for leaf in leaves(task.plan):
+        if isinstance(leaf, ShuffleReadExec):
+            blocks = task.shuffle_blocks.get(leaf.from_stage_id)
+            if blocks is not None:
+                total += sum(b.byte_length for b in blocks)
+    return total
 
 
-def _leaf_node(plan: PhysicalPlan) -> PhysicalPlan:
-    if not plan.children:
-        return plan
-    return _leaf_node(plan.children[0])
+def _tuple_key(exprs: list[Expression], record: Record) -> tuple:
+    return tuple(expr.evaluate(record) for expr in exprs)
+
+
+def _scalar_key(expr: Expression, record: Record) -> object:
+    return expr.evaluate(record)
 
 
 def _estimate_bytes(rows: list[dict]) -> int:
