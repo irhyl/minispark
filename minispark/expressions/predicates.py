@@ -15,6 +15,10 @@ class Not(Expression):
     def evaluate(self, record: Record) -> Any:
         return not bool(self.child.evaluate(record))
 
+    @property
+    def children(self) -> list[Expression]:
+        return [self.child]
+
     def __repr__(self) -> str:
         return f"Not({self.child!r})"
 
@@ -26,6 +30,10 @@ class IsNull(Expression):
     def evaluate(self, record: Record) -> Any:
         return self.child.evaluate(record) is None
 
+    @property
+    def children(self) -> list[Expression]:
+        return [self.child]
+
     def __repr__(self) -> str:
         return f"IsNull({self.child!r})"
 
@@ -36,6 +44,10 @@ class IsNotNull(Expression):
 
     def evaluate(self, record: Record) -> Any:
         return self.child.evaluate(record) is not None
+
+    @property
+    def children(self) -> list[Expression]:
+        return [self.child]
 
     def __repr__(self) -> str:
         return f"IsNotNull({self.child!r})"
