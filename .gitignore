@@ -10,10 +10,14 @@ build/
 dist/
 *.log
 
-# generated data / benchmark artifacts (not source) — small hand-written
+# generated data / benchmark artifacts (not source). Small hand-written
 # sample files like data/users.csv are tracked; generated datasets are not.
+# Shuffle scratch files live under the OS temp dir (tempfile.mkdtemp()),
+# never inside the repo, so there is no /shuffle/ output directory to
+# ignore here; an earlier unanchored "shuffle/" pattern matched every
+# directory named shuffle at any depth, including the real source package
+# minispark/shuffle/, and silently hid it from git.
 data/generated/
 output/
 checkpoints/
-shuffle/
 benchmarks/results/
