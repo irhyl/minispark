@@ -254,8 +254,9 @@ plugs into.
 ## What this is not
 
 No compression (`ExecutionConfig.shuffle_compression` exists but is not
-read by anything yet). No spilling an in-progress partial-aggregate hash
-table to disk under memory pressure (Milestone 9). No shuffle across
-machines: every block is a local file under one machine's temp
-directory, real multiprocessing on one machine, not a distributed
-shuffle service.
+read by anything yet). No shuffle across machines: every block is a
+local file under one machine's temp directory, real multiprocessing on
+one machine, not a distributed shuffle service. (The partial-aggregate
+hash table itself, upstream of the shuffle write, does spill to disk
+under memory pressure, see `docs/spilling.md`, a different mechanism
+from anything on this page.)
