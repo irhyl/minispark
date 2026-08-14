@@ -256,7 +256,9 @@ plugs into.
 No compression (`ExecutionConfig.shuffle_compression` exists but is not
 read by anything yet). No shuffle across machines: every block is a
 local file under one machine's temp directory, real multiprocessing on
-one machine, not a distributed shuffle service. (The partial-aggregate
-hash table itself, upstream of the shuffle write, does spill to disk
-under memory pressure, see `docs/spilling.md`, a different mechanism
-from anything on this page.)
+one machine, not a distributed shuffle service (see
+`docs/distributed-readiness.md` for exactly what the block format
+already gets right for a future fetch-over-network read path, and what
+it does not). (The partial-aggregate hash table itself, upstream of the
+shuffle write, does spill to disk under memory pressure, see
+`docs/spilling.md`, a different mechanism from anything on this page.)
