@@ -73,3 +73,26 @@ def test_real_end_to_end_collect_under_local_n():
 
     rows = sorted(result.collect(), key=lambda r: r["name"])
     assert rows == [{"name": "alice"}, {"name": "carol"}, {"name": "dave"}]
+
+
+def test_csv_byte_offset_seeking_is_correct_across_real_worker_processes(tmp_path):
+    """Milestone 9: each CSV partition's records_fn (storage/csv.py's
+    `_read_csv_range`) seeks to a byte offset computed once by the driver
+    (`_locate_partition_offsets`) and pickled into the Task sent to a
+    worker process. This proves that offset survives the real pickle/
+    unpickle/seek round-trip through a real ProcessPoolExecutor worker,
+    not just in-process, and that every partition reads its own rows
+    exactly once (no row dropped or duplicated by an off-by-one in the
+    offset math) with enough partitions that every worker handles more
+    than one."""
+    csv_path = tmp_path / "wide.csv"
+    lines = ["id,value"] + [f"{i},{i * 7}" for i in range(200)]
+    csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    session = (
+        MiniSparkSession.builder.master("local[3]").app_name("csv_offset_mp_test").get_or_create()
+    )
+    df = session.read.csv(str(csv_path), num_partitions=9)
+    rows = sorted(df.collect(), key=lambda r: r["id"])
+
+    assert rows == [{"id": i, "value": i * 7} for i in range(200)]
