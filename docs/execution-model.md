@@ -1,6 +1,6 @@
 # Execution Model
 
-How a physical plan becomes running tasks, as of Milestone 5. See
+How a physical plan becomes running tasks, as of Milestone 6. See
 `docs/query-planning.md` for everything upstream of this (logical plan,
 analyzer, optimizer, physical plan) and `docs/shuffle.md` for what
 specifically happens at a shuffle boundary; this document covers the
@@ -104,7 +104,12 @@ anything that exists).
 `FAILED`/`RETRYING`/`CANCELLED`), the task's materialized `rows`, its
 `metrics`, and `error` as a plain string when failed, not an exception
 object (an exception instance is not guaranteed picklable/reconstructable
-across a process boundary; a message string always is).
+across a process boundary; a message string always is). A failed result
+also carries `missing_shuffle_stage_id: int | None`, set only when the
+failure was a `MissingShuffleDataError` (see "Lineage-based
+recomputation" below), which is how `LocalScheduler` tells a task whose
+input needs to be regenerated apart from one that just needs an ordinary
+retry.
 
 ## Worker
 
@@ -168,11 +173,94 @@ own dedicated tests that assert on things a stub cannot fake, like
 observing a worker's OS process id
 (`tests/integration/test_scheduler_multiprocessing.py`).
 
+## Lineage-based recomputation
+
+Milestone 3's task retry (above) re-runs the *same* task in place, using
+the exact same shuffle blocks it was given the first time: correct for an
+ordinary, possibly-transient failure, but useless if the failure is that
+those blocks are no longer readable, retrying the same read just fails
+the same way forever. `physical/operators.py`'s
+`_execute_shuffle_read_partition` catches exactly that case (a block
+file gone, `FileNotFoundError`, or corrupted, `ShuffleChecksumError`,
+see `docs/shuffle.md`) and re-raises it as `MissingShuffleDataError`
+(`shuffle/reader.py`), naming the upstream `stage_id` and target
+partition it came from. `execution/worker.py`'s `execute_task` catches
+that specific exception type separately from every other, and records
+the stage_id on the returned `TaskResult.missing_shuffle_stage_id`.
+
+`LocalScheduler._try_recover_missing_shuffle` is what actually
+recomputes: it looks up the stage that produced the missing blocks (every
+stage a `run_plan()` call is given is kept in a `stage_id -> Stage`
+dict), re-runs every one of that stage's tasks from scratch exactly like
+its first run, re-registers whatever fresh blocks that produces into the
+`ShuffleManager` (overwriting the stale entry, see `docs/shuffle.md`),
+and rebuilds the originally-failing task with freshly resolved
+`shuffle_blocks` before handing it back to the retry loop. If that
+upstream stage itself reads shuffle input that also turns out to be
+missing, the same mechanism fires again first, so recovery can walk back
+through more than one stage, bounded only by how many stages the plan
+has. A `run_plan()` call recomputes any one stage at most once: a `set`
+of already-recomputed stage_ids is threaded through the whole run, and a
+stage whose data goes missing a second time is treated as an ordinary
+failure (retried up to `max_retries`, then `TaskExecutionError`) instead
+of being recomputed forever. A successful recovery does not consume any
+of the failing task's own retry budget, since the task itself did not do
+anything wrong, its input was gone.
+
+**What this recovers, and what it does not.** This regenerates data that
+was computed successfully once and then became unreadable (the scenario
+proven in `tests/integration/test_lineage_recovery_e2e.py`, which deletes
+a real shuffle block file mid-query under real `local[2]` multiprocessing
+and confirms the query still produces the correct result). It cannot
+recover from a source that was never readable in the first place (a
+missing CSV file still fails the query, correctly), and it does not track
+exactly which *source task* wrote a lost block, a lost target partition's
+data is recovered by recomputing its *entire* upstream stage, not just
+the specific source tasks that happened to contribute to that partition.
+This is the same coarse-grained, stage-level recomputation granularity
+Spark's shuffle fetch-failure recovery falls back to without fine-grained
+map-output tracking; a real map-output tracker (recording exactly which
+source task wrote which target partition, and recomputing only those
+tasks) is more precise but is not needed to demonstrate the core
+mechanism here. There is also no distinct "worker lost its local disk"
+failure domain to simulate: every shuffle block for a query already lives
+under one shared scratch directory on the one local machine (see
+`docs/shuffle.md`), not on a per-worker-process local disk the way a real
+multi-machine cluster's executors would have, so the realistic failure
+this milestone simulates is a lost or corrupted block *file*, not a lost
+*machine*.
+
+## Checkpointing
+
+`DataFrame.checkpoint()` (`api/dataframe.py`) is the other half of
+Milestone 6: it runs the current plan now (exactly like `collect()`) and
+writes the result to a durable, on-disk checkpoint directory
+(`storage/checkpoint.py`), then returns a *new* `DataFrame` whose logical
+plan is a single, fresh `Scan` over that checkpoint. Everything that
+built the checkpointed data, every `Filter`/`Project`/`Join`/`Aggregate`/
+`Sort` in the original plan, is gone from the new plan. That is what
+"truncates lineage" means in practice: if a query built on the
+checkpointed `DataFrame` is later recomputed (lineage-based recovery,
+above, or simply run again), it re-reads the checkpoint directory, not
+the original computation, however expensive that was.
+`tests/integration/test_checkpoint_e2e.py` proves this directly, not just
+by inspecting plan shape: the original source is instrumented to count
+how many times it is read, and that count does not increase after
+`checkpoint()`, even when the checkpointed `DataFrame` is further
+transformed and collected. Unlike the shuffle scratch directory (removed
+at the end of every query, see `docs/shuffle.md`), nothing removes a
+checkpoint directory automatically: a checkpoint is meant to outlive the
+query that wrote it, so there is no safe point to delete it from without
+being told to. Managing checkpoint lifetime is left to the caller; there
+is no checkpoint garbage collector.
+
 ## What this is not, yet
 
 No DAG scheduler in the Spark sense (stage retries, speculative execution,
-locality-aware placement), no lineage-based fault recovery, no
-checkpointing, no dynamic resource allocation, no cost-based join
+locality-aware placement), no fine-grained (per-source-task) map-output
+tracking for lineage recovery, only coarse-grained (per-stage) recompute
+(see "Lineage-based recomputation" above), no automatic checkpoint
+lifetime management, no dynamic resource allocation, no cost-based join
 strategy selection (broadcast is an explicit hint, see
 `logical/nodes.py`'s `Join` docstring), no sort-merge join (only hash
 join, broadcast or shuffled). `local[N]` is real multiprocessing on one
