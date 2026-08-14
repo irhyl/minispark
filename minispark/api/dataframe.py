@@ -18,6 +18,8 @@ import tempfile
 from typing import TYPE_CHECKING
 
 from minispark.api.grouped import GroupedData
+from minispark.api.writer import DataFrameWriter
+from minispark.core.dataset import Dataset
 from minispark.core.record import Record
 from minispark.core.schema import Schema
 from minispark.execution.scheduler import LocalScheduler
@@ -122,9 +124,19 @@ class DataFrame:
         engine = self._session.config.engine
         return LocalScheduler(num_workers=engine.num_workers, max_retries=engine.max_task_retries)
 
+    def _collect_dataset(self) -> Dataset:
+        """Run this DataFrame's plan and return the resulting Dataset,
+        still split into partitions (unlike `collect()`, which flattens
+        to one list). The shared seam behind `collect()`, `count()`,
+        `checkpoint()`, and `DataFrameWriter.parquet()` (api/writer.py):
+        every one of them needs "run the plan, get the rows back", and
+        `checkpoint()`/`write.parquet()` specifically need the per-
+        partition split preserved, not merged.
+        """
+        return self._scheduler().run_plan(self._stages())
+
     def collect(self) -> list[Record]:
-        dataset = self._scheduler().run_plan(self._stages())
-        return list(dataset.iter_records())
+        return list(self._collect_dataset().iter_records())
 
     def checkpoint(self, directory: str | None = None) -> DataFrame:
         """Run this DataFrame now and durably materialize the result to
@@ -153,15 +165,21 @@ class DataFrame:
         checkpoints) is left to the caller; there is no garbage collector
         for them yet.
         """
-        dataset = self._scheduler().run_plan(self._stages())
+        dataset = self._collect_dataset()
         target = directory or tempfile.mkdtemp(prefix="minispark-checkpoint-")
         write_checkpoint(dataset, target)
-        checkpointed = CheckpointDataSource(target).read()
-        return DataFrame(self._session, Scan(checkpointed, source_name=f"checkpoint:{target}"))
+        source = CheckpointDataSource(target)
+        checkpointed = source.read()
+        return DataFrame(
+            self._session, Scan(checkpointed, source_name=f"checkpoint:{target}", source=source)
+        )
 
     def count(self) -> int:
-        dataset = self._scheduler().run_plan(self._stages())
-        return dataset.row_count()
+        return self._collect_dataset().row_count()
+
+    @property
+    def write(self) -> DataFrameWriter:
+        return DataFrameWriter(self)
 
     def show(self, n: int = 20) -> None:
         rows = self.collect()[:n]
