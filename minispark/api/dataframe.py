@@ -119,6 +119,7 @@ class DataFrame:
         physical = plan_physical(
             self._optimized_plan(),
             shuffle_partitions=self._session.config.execution.shuffle_partitions,
+            spill_threshold_bytes=self._session.config.memory.spill_threshold_bytes,
         )
         return build_stages(physical)
 
@@ -231,7 +232,9 @@ class DataFrame:
         print("== Optimized Logical Plan ==")
         print(explain_string(optimized_plan))
         physical = plan_physical(
-            optimized_plan, shuffle_partitions=self._session.config.execution.shuffle_partitions
+            optimized_plan,
+            shuffle_partitions=self._session.config.execution.shuffle_partitions,
+            spill_threshold_bytes=self._session.config.memory.spill_threshold_bytes,
         )
         print()
         print("== Physical Plan ==")
