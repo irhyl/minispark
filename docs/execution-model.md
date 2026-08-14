@@ -1,6 +1,6 @@
 # Execution Model
 
-How a physical plan becomes running tasks, as of Milestone 6. See
+How a physical plan becomes running tasks, as of Milestone 8. See
 `docs/query-planning.md` for everything upstream of this (logical plan,
 analyzer, optimizer, physical plan) and `docs/shuffle.md` for what
 specifically happens at a shuffle boundary; this document covers the
@@ -97,7 +97,7 @@ anything that exists).
 | `output_records` | exact for a normal task; `0` for a shuffle-write task (its output is blocks, not rows, see `shuffle_bytes`) |
 | `output_bytes` | rough heuristic (`sys.getsizeof` summed over row values), not an on-disk byte count, same caveat as `optimizer/statistics.py`; `0` for a shuffle-write task |
 | `input_bytes` | not implemented (would need byte-offset tracking in the storage layer) |
-| `cpu_time_seconds`, `peak_memory_bytes` | not implemented (would need the `psutil` optional dependency, not added yet) |
+| `cpu_time_seconds`, `peak_memory_bytes` | Milestone 8: filled in by `execution/worker.py` via the optional `psutil` dependency, `None` if it is not installed; `peak_memory_bytes` is this worker process's RSS at task completion, not a true continuously-sampled peak (would need a concurrently running background thread, not implemented) |
 | `shuffle_bytes` | `0` for a task with no shuffle input or output; for a shuffle-write task, total bytes written across all target partitions; for a shuffle-read task, total bytes read for its one target partition |
 
 `TaskResult` carries `state` (a `TaskState`: `PENDING`/`RUNNING`/`SUCCESS`/
@@ -254,6 +254,40 @@ query that wrote it, so there is no safe point to delete it from without
 being told to. Managing checkpoint lifetime is left to the caller; there
 is no checkpoint garbage collector.
 
+## Metrics and profiling
+
+Per-task `TaskMetrics` existed since Milestone 3, but nothing aggregated
+them across a stage or a whole query, and no `DataFrame` action exposed
+them to a caller at all: a `TaskResult`'s `metrics` was read exactly
+once, for `output_records`, by `_results_to_dataset()`, then discarded.
+Milestone 8's `execution/metrics.py` adds `StageMetrics` (one per stage
+*run*, summed/maxed from that stage's tasks' `TaskMetrics`) and
+`QueryMetrics` (every `StageMetrics` from one `run_plan()` call, plus
+total wall-clock time). `LocalScheduler.run_plan()` builds one
+`QueryMetrics` per call and stores it on `self.last_metrics`, a plain
+attribute rather than a change to `run_plan()`'s existing `Dataset`-only
+return type (every caller already depends on that signature).
+`api/dataframe.py`'s `DataFrame._collect_dataset()` (the shared seam
+behind `collect()`/`count()`/`checkpoint()`/`write.parquet()`) reads
+`scheduler.last_metrics` right after calling `run_plan()` and exposes it
+as `DataFrame.last_run_metrics`, `None` until an action has actually
+run.
+
+A lineage-recomputed stage (see above) gets its *own* `StageMetrics`
+entry in `QueryMetrics.stages`, marked `recomputed=True`, not merged
+into the stage's original entry: both runs did real, separately
+measurable work, and folding them together would understate the total
+cost a fault actually imposed.
+
+Deliberately **not** threaded into `DataFrame.explain()`: `explain()`
+has never executed anything (Milestone 1's behavior, still true), and
+conflating "show me the plan" with "run the query and show me what
+happened" would be an unwanted change to an already-stable, highly
+visible method's contract. Metrics describe what *happened*, only ever
+available after an action has actually run, mirroring how real Spark's
+execution metrics come from the Spark UI/status tracker after a job
+runs, not from `df.explain()`.
+
 ## What this is not, yet
 
 No DAG scheduler in the Spark sense (stage retries, speculative execution,
@@ -263,5 +297,7 @@ tracking for lineage recovery, only coarse-grained (per-stage) recompute
 lifetime management, no dynamic resource allocation, no cost-based join
 strategy selection (broadcast is an explicit hint, see
 `logical/nodes.py`'s `Join` docstring), no sort-merge join (only hash
-join, broadcast or shuffled). `local[N]` is real multiprocessing on one
-machine; nothing here talks to another machine, and nothing claims to.
+join, broadcast or shuffled), no true continuous-sampling peak-memory
+profiling (see the `TaskMetrics` table above). `local[N]` is real
+multiprocessing on one machine; nothing here talks to another machine,
+and nothing claims to.
