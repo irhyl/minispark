@@ -15,6 +15,18 @@ cost of re-reading (not re-parsing the whole file, just seeking past
 earlier rows) once per partition. A production system would instead
 record byte offsets per partition to seek directly; that optimization is
 skipped here as unnecessary complexity for Milestone 1's goals.
+
+`read(columns=...)` (Milestone 7) is real, if partial, projection
+pruning: `csv.reader` still tokenizes every field on every line (there is
+no way to skip that for a row-oriented text format without an index), but
+`_coerce_row` only runs `_try_parse` (the actual per-value conversion
+work) for requested columns, and every Record built downstream is
+already the narrow, pruned width. `filter` is accepted for interface
+uniformity with every DataSource but is not honored: CSV has no
+statistics to skip rows or row ranges against, unlike Parquet's row-group
+metadata (see storage/parquet.py), so a pushed filter would only mean
+"evaluate it earlier," not "read less," and is not worth the added
+complexity here.
 """
 
 from __future__ import annotations
@@ -30,6 +42,7 @@ from minispark.core.partition import Partition, PartitionMetadata
 from minispark.core.record import Record
 from minispark.core.schema import Field, Schema
 from minispark.core.types import STRING, DataType, infer_type
+from minispark.expressions.base import Expression
 from minispark.storage.datasource import DataSource
 
 _SCHEMA_SAMPLE_ROWS = 1000
@@ -79,11 +92,19 @@ def _infer_schema_from_sample(path: Path, header: list[str]) -> Schema:
     return Schema(fields)
 
 
-def _coerce_row(header: list[str], row: list[str]) -> Record:
-    return {name: _try_parse(raw) for name, raw in zip(header, row, strict=True)}
+def _coerce_row(header: list[str], row: list[str], wanted: frozenset[str] | None) -> Record:
+    if wanted is None:
+        return {name: _try_parse(raw) for name, raw in zip(header, row, strict=True)}
+    return {
+        name: _try_parse(raw)
+        for name, raw in zip(header, row, strict=True)
+        if name in wanted
+    }
 
 
-def _read_csv_range(path: Path, header: list[str], start: int, end: int) -> Iterator[Record]:
+def _read_csv_range(
+    path: Path, header: list[str], start: int, end: int, columns: list[str] | None
+) -> Iterator[Record]:
     """Stream rows `[start, end)` of `path`, re-opening the file.
 
     Module-level, not a nested closure, so `CSVDataSource._make_records_fn`
@@ -94,12 +115,13 @@ def _read_csv_range(path: Path, header: list[str], start: int, end: int) -> Iter
     function and picklable arguments is. See storage/memory.py's
     `_make_records_fn` for the same fix on the in-memory source.
     """
+    wanted = frozenset(columns) if columns is not None else None
     with path.open(newline="", encoding="utf-8") as f:
         reader = csv.reader(f)
         next(reader)  # header
         window = itertools.islice(reader, start, end)
         for row in window:
-            yield _coerce_row(header, row)
+            yield _coerce_row(header, row, wanted)
 
 
 class CSVDataSource(DataSource):
@@ -114,13 +136,14 @@ class CSVDataSource(DataSource):
     def name(self) -> str:
         return f"csv:{self._path}"
 
-    def read(self) -> Dataset:
+    def read(self, columns: list[str] | None = None, filter: Expression | None = None) -> Dataset:
         with self._path.open(newline="", encoding="utf-8") as f:
             reader = csv.reader(f)
             header = next(reader)
             row_count = sum(1 for _ in reader)
 
-        schema = self._explicit_schema or _infer_schema_from_sample(self._path, header)
+        full_schema = self._explicit_schema or _infer_schema_from_sample(self._path, header)
+        schema = full_schema.select(columns) if columns is not None else full_schema
 
         n = max(1, min(self._num_partitions, row_count or 1))
         chunk_size = -(-row_count // n) if row_count else 0
@@ -133,7 +156,7 @@ class CSVDataSource(DataSource):
                 Partition(
                     partition_id=i,
                     schema=schema,
-                    records_fn=self._make_records_fn(header, start, end),
+                    records_fn=self._make_records_fn(header, start, end, columns),
                     metadata=PartitionMetadata(location=str(self._path), row_count=end - start),
                 )
             )
@@ -143,8 +166,8 @@ class CSVDataSource(DataSource):
             ]
         return Dataset(schema, partitions)
 
-    def _make_records_fn(self, header: list[str], start: int, end: int):
-        return functools.partial(_read_csv_range, self._path, header, start, end)
+    def _make_records_fn(self, header: list[str], start: int, end: int, columns: list[str] | None):
+        return functools.partial(_read_csv_range, self._path, header, start, end, columns)
 
 
 def read_csv(path: str, schema: Schema | None = None, num_partitions: int = 4) -> Dataset:
