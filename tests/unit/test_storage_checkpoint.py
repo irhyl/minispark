@@ -84,3 +84,24 @@ def test_write_checkpoint_overwrites_an_existing_checkpoint(tmp_path):
     checkpointed = CheckpointDataSource(str(tmp_path)).read()
     assert checkpointed.num_partitions() == 2
     assert sorted(r["country"] for r in checkpointed.iter_records()) == ["CA", "UK"]
+
+
+def test_read_columns_narrows_schema_and_rows(tmp_path):
+    dataset = make_dataset([[{"country": "US", "revenue": 1}, {"country": "CA", "revenue": 2}]])
+    write_checkpoint(dataset, str(tmp_path))
+    narrowed = CheckpointDataSource(str(tmp_path)).read(columns=["country"])
+    assert narrowed.schema.field_names() == ["country"]
+    assert list(narrowed.iter_records()) == [{"country": "US"}, {"country": "CA"}]
+
+
+def test_read_filter_argument_is_accepted_but_does_not_change_output(tmp_path):
+    from minispark.expressions.binary import GreaterThan
+    from minispark.expressions.column import Column
+    from minispark.expressions.literal import Literal
+
+    dataset = make_dataset([[{"country": "US", "revenue": 1}, {"country": "CA", "revenue": 2}]])
+    write_checkpoint(dataset, str(tmp_path))
+    result = CheckpointDataSource(str(tmp_path)).read(
+        filter=GreaterThan(Column("revenue"), Literal(1))
+    )
+    assert len(list(result.iter_records())) == 2
