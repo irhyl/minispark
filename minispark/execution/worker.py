@@ -24,6 +24,14 @@ shuffle boundary, see execution/stages.py) takes a different path: its
 output is shuffle blocks written to disk, not rows returned to the
 driver. `_execute_shuffle_write_task` handles that case; every other task
 goes through the normal `execute_partition` -> rows path.
+
+A `MissingShuffleDataError` (shuffle/reader.py, raised when a task tries
+to read a prior stage's shuffle blocks and the block file is gone or its
+checksum no longer matches) is caught separately from every other
+exception, and reports which upstream stage_id was affected on the
+returned `TaskResult`. That is what lets execution/scheduler.py tell a
+task that needs its missing input recomputed apart from one that just
+needs to be retried in place (Milestone 6's lineage-based recovery).
 """
 
 from __future__ import annotations
@@ -46,6 +54,7 @@ from minispark.physical.plan import (
     leaves,
 )
 from minispark.shuffle.partitioner import HashPartitioner, Partitioner, RangePartitioner
+from minispark.shuffle.reader import MissingShuffleDataError
 from minispark.shuffle.writer import write_shuffle_partition
 
 
@@ -62,6 +71,15 @@ def execute_task(task: Task, attempt_number: int = 0) -> TaskResult:
             result = _execute_shuffle_write_task(task)
         else:
             result = _execute_normal_task(task)
+    except MissingShuffleDataError as exc:
+        elapsed = time.perf_counter() - start
+        return TaskResult(
+            task_id=task.task_id,
+            state=TaskState.FAILED,
+            metrics=TaskMetrics(execution_time_seconds=elapsed),
+            error=str(exc),
+            missing_shuffle_stage_id=exc.stage_id,
+        )
     except Exception as exc:
         elapsed = time.perf_counter() - start
         return TaskResult(
