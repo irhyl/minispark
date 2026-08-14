@@ -8,7 +8,7 @@ Spark replacement, and no performance claim in this repository is made without
 an accompanying, reproducible benchmark (see `docs/benchmarks.md`, added once
 there is something real to measure).
 
-## Status: Milestone 6
+## Status: Milestone 7
 
 Implemented so far:
 
@@ -36,7 +36,9 @@ Implemented so far:
   elimination; every rule handles every logical node type) that runs to a
   fixed point, plus `statistics.py` (exact, full-scan table/column
   statistics, used directly by `Sort`'s physical planning, not yet by any
-  optimizer rule).
+  optimizer rule). These rules compute plan *shape* only (never touch
+  data); `physical/planner.py`'s scan-pushdown pass is what turns their
+  output into an actual, smaller read (see below).
 - **Physical plan** (`minispark/physical/`): translates an optimized
   logical plan into physical operators. `Scan`/`Filter`/`Project`
   translate 1:1; `Aggregate` becomes a partial (map-side) aggregate, a
@@ -44,6 +46,12 @@ Implemented so far:
   `HashJoinExec` fed by either two shuffle exchanges (shuffle hash join,
   the default) or one broadcast exchange (`broadcast=True`); `Sort`
   becomes a local sort, a range-partitioned exchange, and a final sort.
+  Before any of that translation, a scan-pushdown pass re-reads a `Scan`
+  with real column/predicate hints wherever a Project/Filter chain and
+  the underlying source both allow it (real for Parquet: column pruning
+  and row-group-level predicate pushdown; real column pruning only for
+  CSV/Memory/Checkpoint), the second, deliberate exception (after
+  `Sort`'s range boundaries) to "building a plan never touches data."
 - **Shuffle** (`minispark/shuffle/`): `HashPartitioner` (stable across
   processes, does not use Python's randomized builtin `hash()`, used by
   `group_by`/`join`) and `RangePartitioner` (used by `order_by()`), a
@@ -52,9 +60,17 @@ Implemented so far:
   partial state), and a driver-side `ShuffleManager` tracking which
   blocks exist for which stage/partition, including broadcast reads.
 - **Storage** (`minispark/storage/`): an in-memory `DataSource`, a CSV
-  `DataSource` with schema inference and partitioned, streaming reads,
-  and a checkpoint `DataSource` (reads back a `Dataset` durably
-  materialized to local disk by `DataFrame.checkpoint()`).
+  `DataSource` with schema inference and partitioned, streaming reads, a
+  checkpoint `DataSource` (reads back a `Dataset` durably materialized to
+  local disk by `DataFrame.checkpoint()`), and a Parquet `DataSource`
+  (real, pyarrow-backed columnar storage: genuine column pruning and
+  row-group-level predicate pushdown, partitioned at row-group
+  granularity, plus a writer producing one `.parquet` file per
+  partition). `pyarrow` is an optional extra (`pip install
+  minispark[columnar]`); nothing outside `storage/parquet.py` imports it,
+  and even that module's callers (`session.read.parquet()`, `df.write.
+  parquet()`) import it lazily, so using every other source never
+  requires it installed.
 - **Lazy DataFrame API** (`minispark/api/`): `filter()` / `select()` /
   `group_by()` / `join()` / `order_by()` (alias `sort()`) build plan nodes
   only; `collect()` / `show()` / `count()` / `explain()` are the only
@@ -63,7 +79,8 @@ Implemented so far:
   plans, plus every stage the query splits into. `checkpoint()` also
   triggers execution (eagerly, like `collect()`), then returns a new
   DataFrame whose plan is a fresh scan over the durably-materialized
-  result, cutting the original plan's lineage at that point.
+  result, cutting the original plan's lineage at that point. `write`
+  returns a `DataFrameWriter` (`df.write.parquet(path)`), also eager.
 - **DAG, stages, and tasks** (`minispark/execution/dag.py`,
   `stages.py`, `tasks.py`): classifies every physical node's dependency
   as narrow or wide (a shuffle `Exchange` is the one wide node), splits a
@@ -92,17 +109,25 @@ Implemented so far:
 
 Not implemented yet (by design, not oversight): left/right/full outer or
 semi/anti joins, differently-named join keys, sort-merge join,
-cost-based join strategy selection, columnar execution, SQL, and
-benchmarking. Every one of those has a numbered section in the build spec
-this project follows and lands in its own milestone (or, for the
-join-scope items, is an explicit, documented simplification of
-Milestone 5's own scope, see `logical/nodes.py`'s `Join` docstring).
-Within what Milestone 6 does cover: lineage-based recomputation is
-stage-granular (a lost partition is recovered by recomputing its entire
-upstream stage, not just the specific tasks that produced it) and capped
-at one recompute per stage per query; there is no automatic checkpoint
-directory lifetime management, `checkpoint()` never deletes an old
-checkpoint.
+cost-based join strategy selection, SQL, and benchmarking. Every one of
+those has a numbered section in the build spec this project follows and
+lands in its own milestone (or, for the join-scope items, is an explicit,
+documented simplification of Milestone 5's own scope, see
+`logical/nodes.py`'s `Join` docstring). Within what Milestone 6 does
+cover: lineage-based recomputation is stage-granular (a lost partition is
+recovered by recomputing its entire upstream stage, not just the
+specific tasks that produced it) and capped at one recompute per stage
+per query; there is no automatic checkpoint directory lifetime
+management, `checkpoint()` never deletes an old checkpoint. Within what
+Milestone 7 does cover (see `docs/columnar-storage.md`): execution stays
+row-at-a-time everywhere except the Parquet read path itself, there is no
+vectorized Filter/Project; predicate pushdown only fires along a
+Filter-directly-on-Scan chain (never past a Project) and only covers
+comparisons/`And`/`Or`/`Not`/null-checks, no arithmetic; only
+bool/int/float/str/null round-trip through Parquet, no date/timestamp/
+decimal/nested types; row-group-to-partition assignment is contiguous
+chunking, not size-aware balancing; and `write.parquet()` has no
+target-file-size control or small-file coalescing.
 
 ## Quick start
 
@@ -113,6 +138,10 @@ python examples/basic_dataframe.py
 python examples/aggregations.py
 python examples/joins.py
 python examples/checkpointing.py
+
+# Parquet support needs the optional columnar extra:
+pip install -e ".[columnar]"
+python examples/parquet.py
 ```
 
 ```python
@@ -136,13 +165,15 @@ result.show()
 
 See `docs/architecture.md` for the layered design and why each layer
 exists, `docs/query-planning.md` for how a DataFrame call gets from a
-logical plan to a physical plan (analyzer, optimizer, physical plan),
-`docs/execution-model.md` for how that physical plan actually runs (DAG,
-stages, tasks, the local scheduler, what `local[N]` really does, and how
-lineage-based recomputation and checkpointing work), and `docs/shuffle.md`
-for exactly what happens at a shuffle boundary (partial aggregation,
-hash partitioning, the on-disk block format shared by shuffle blocks and
-checkpoints).
+logical plan to a physical plan (analyzer, optimizer, physical plan,
+including the scan-pushdown pass), `docs/execution-model.md` for how
+that physical plan actually runs (DAG, stages, tasks, the local
+scheduler, what `local[N]` really does, and how lineage-based
+recomputation and checkpointing work), `docs/shuffle.md` for exactly
+what happens at a shuffle boundary (partial aggregation, hash
+partitioning, the on-disk block format shared by shuffle blocks and
+checkpoints), and `docs/columnar-storage.md` for Parquet reading/
+writing, real column pruning, and real predicate pushdown.
 
 ## Development
 
