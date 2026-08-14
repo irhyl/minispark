@@ -4,6 +4,16 @@ Owns configuration and exposes `.read` (DataFrameReader) and
 `create_dataframe` (in-memory data, mainly for tests/examples). It does
 not yet own a scheduler or worker pool — those arrive in Milestone 3, at
 which point session becomes responsible for starting/stopping them.
+
+`sql()` (Milestone 8) is the other entry point into a `DataFrame`: it
+parses a SQL string (`minispark.sql.parser.parse_sql`) into the same
+`LogicalPlan` nodes `create_dataframe()`/`.filter()`/`.select()`/etc.
+build, resolving table names against `create_or_replace_temp_view()`'s
+registry. Nothing about analysis, optimization, physical planning, or
+execution differs afterward: a `DataFrame` built from SQL is completely
+indistinguishable from one built by chaining DataFrame API calls, which
+is the point (see the build spec's "no separate SQL execution engine"
+rule, and docs/sql.md).
 """
 
 from __future__ import annotations
@@ -14,6 +24,7 @@ from minispark.config.log import configure_logging, get_logger
 from minispark.core.record import Record
 from minispark.core.schema import Schema
 from minispark.logical.nodes import Scan
+from minispark.sql.parser import parse_sql
 from minispark.storage.csv import CSVDataSource
 from minispark.storage.memory import MemoryDataSource
 
@@ -79,6 +90,7 @@ class MiniSparkSession:
     def __init__(self, config: Config | None = None, app_name: str = "minispark-app"):
         self.config = config or Config()
         self.app_name = app_name
+        self._temp_views: dict[str, DataFrame] = {}
         configure_logging()
         logger.info(
             "SessionCreated app_name=%s master=%s", self.app_name, self.config.engine.master
@@ -94,3 +106,25 @@ class MiniSparkSession:
         source = MemoryDataSource(records, schema=schema, num_partitions=num_partitions)
         dataset = source.read()
         return DataFrame(self, Scan(dataset, source_name="memory", source=source))
+
+    def create_or_replace_temp_view(self, name: str, df: DataFrame) -> None:
+        """Register `df` under `name` so `sql("SELECT ... FROM name")` can
+        find it. A plain in-memory, session-scoped dict, not a real
+        catalog: nothing is persisted, and a second call with the same
+        `name` silently replaces the first (matching PySpark's own
+        `createOrReplaceTempView` naming and behavior). `df` itself is
+        never executed here; only its `.plan` (still fully lazy) is kept,
+        looked up by `sql()` when a query actually references `name`.
+        """
+        self._temp_views[name] = df
+
+    def sql(self, query: str) -> DataFrame:
+        """Parse `query` and return the equivalent DataFrame, unanalyzed
+        and unexecuted, exactly as if it had been built by chaining
+        DataFrame API calls. See minispark.sql.parser's module docstring
+        for the supported SQL subset and docs/sql.md for the full
+        picture.
+        """
+        tables = {name: df.plan for name, df in self._temp_views.items()}
+        plan = parse_sql(query, tables)
+        return DataFrame(self, plan)
