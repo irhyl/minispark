@@ -1,12 +1,16 @@
+import os
 import pickle
+import random
 
 from minispark.api.functions import avg, col, count
+from minispark.api.functions import min as smin
 from minispark.api.functions import sum as ssum
 from minispark.core.dataset import Dataset
 from minispark.core.partition import Partition, PartitionMetadata
 from minispark.core.schema import Field, Schema
 from minispark.core.types import INT, STRING
 from minispark.logical.nodes import Aggregate, Scan
+from minispark.physical import operators as operators_module
 from minispark.physical.operators import execute_partition
 from minispark.physical.plan import ExchangeExec, HashAggregateExec, ScanExec
 from minispark.physical.planner import plan_physical
@@ -106,3 +110,140 @@ def test_physical_plan_with_aggregate_is_picklable():
     restored = pickle.loads(pickle.dumps(physical))
     rows = execute_partition(restored.child.child, 0).to_list()
     assert rows == [{"country": "US", "__agg_state_0": (10, 1)}]
+
+
+def test_partial_spilling_produces_same_states_as_non_spilling():
+    """A spill_threshold_bytes well under the full working set forces the
+    grace-hash spill path (`_spill_groups` plus the bucket-at-a-time
+    merge in `_execute_hash_aggregate_partition`) to trigger several
+    times over a small, collision-prone key space (8 distinct countries,
+    300 rows), which is what actually exercises a key being spilled
+    once, then seen again and re-accumulated from scratch, then
+    reconciled at merge time. Kept deliberately small: because a spill
+    resets the *whole* in-memory table (not just the over-threshold
+    part), a threshold much smaller than the full working set triggers a
+    spill on nearly every row, which is correct but needlessly slow for
+    a test whose job is only to prove the merge is correct, not to
+    exercise thousands of tiny spill files."""
+    random.seed(7)
+    countries = [f"c{i}" for i in range(8)]
+    rows = [
+        {"country": random.choice(countries), "revenue": random.randint(1, 100)}
+        for _ in range(300)
+    ]
+    scan = make_scan(rows)
+    agg = Aggregate(
+        scan,
+        [col("country")],
+        [count("*").alias("n"), ssum("revenue").alias("total"), avg("revenue").alias("avg_rev")],
+    )
+    physical_no_spill = plan_physical(agg, shuffle_partitions=1, spill_threshold_bytes=2**62)
+    physical_spilling = plan_physical(agg, shuffle_partitions=1, spill_threshold_bytes=600)
+    partial_no_spill = physical_no_spill.child.child
+    partial_spilling = physical_spilling.child.child
+
+    no_spill_rows = {r["country"]: r for r in execute_partition(partial_no_spill, 0).to_list()}
+    spilled_rows = {r["country"]: r for r in execute_partition(partial_spilling, 0).to_list()}
+
+    assert set(no_spill_rows) == set(spilled_rows) == set(countries)
+    for country in countries:
+        assert no_spill_rows[country]["__agg_state_0"] == spilled_rows[country]["__agg_state_0"]
+        assert no_spill_rows[country]["__agg_state_1"] == spilled_rows[country]["__agg_state_1"]
+        assert no_spill_rows[country]["__agg_state_2"] == spilled_rows[country]["__agg_state_2"]
+
+
+def test_final_spilling_produces_same_finalized_values_as_non_spilling():
+    """Same idea as the partial-stage test above, but for the post-shuffle
+    final aggregate, which merges upstream partial states via
+    AggregateFunction.merge() instead of folding raw rows via update().
+    Kept small for the same reason (see test_partial_spilling_... above):
+    a spill resets the whole table, so a threshold far below the full
+    working set spills almost every row."""
+    random.seed(11)
+    countries = [f"c{i}" for i in range(8)]
+    partial_schema = Schema(
+        [
+            Field("country", STRING),
+            Field("__agg_state_0", INT),
+            Field("__agg_state_1", INT),
+            Field("__agg_state_2", INT),
+        ]
+    )
+    partial_rows = [
+        {
+            "country": random.choice(countries),
+            "__agg_state_0": random.randint(1, 5),
+            "__agg_state_1": random.randint(1, 200),
+            "__agg_state_2": (random.randint(1, 200), random.randint(1, 5)),
+        }
+        for _ in range(250)
+    ]
+    fake_shuffle_read_a = ScanExec(
+        Dataset(
+            partial_schema,
+            [Partition(0, partial_schema, lambda: iter(partial_rows), PartitionMetadata())],
+        ),
+        "fake",
+    )
+    fake_shuffle_read_b = ScanExec(
+        Dataset(
+            partial_schema,
+            [Partition(0, partial_schema, lambda: iter(partial_rows), PartitionMetadata())],
+        ),
+        "fake",
+    )
+    scan = make_scan([{"country": "US", "revenue": 1}])
+    agg = Aggregate(
+        scan,
+        [col("country")],
+        [count("*").alias("n"), ssum("revenue").alias("total"), smin("revenue").alias("mn")],
+    )
+    physical = plan_physical(agg, shuffle_partitions=1)
+    final_no_spill = HashAggregateExec(
+        fake_shuffle_read_a,
+        physical.group_by,
+        physical.aggregates,
+        physical.schema,
+        is_partial=False,
+        spill_threshold_bytes=2**62,
+    )
+    final_spilling = HashAggregateExec(
+        fake_shuffle_read_b,
+        physical.group_by,
+        physical.aggregates,
+        physical.schema,
+        is_partial=False,
+        spill_threshold_bytes=300,
+    )
+
+    no_spill_result = {r["country"]: r for r in execute_partition(final_no_spill, 0).to_list()}
+    spilled_result = {r["country"]: r for r in execute_partition(final_spilling, 0).to_list()}
+
+    assert set(no_spill_result) == set(spilled_result) == set(countries)
+    for country in countries:
+        assert no_spill_result[country]["n"] == spilled_result[country]["n"]
+        assert no_spill_result[country]["total"] == spilled_result[country]["total"]
+        assert no_spill_result[country]["mn"] == spilled_result[country]["mn"]
+
+
+def test_aggregate_spilling_cleans_up_its_temp_directory_after_full_consumption(monkeypatch):
+    rows = [{"country": f"c{i % 10}", "revenue": i} for i in range(200)]
+    scan = make_scan(rows)
+    agg = Aggregate(scan, [col("country")], [ssum("revenue").alias("total")])
+    physical = plan_physical(agg, shuffle_partitions=1, spill_threshold_bytes=100)
+    partial_exec = physical.child.child
+
+    captured: dict[str, str] = {}
+    real_make_spill_dir = operators_module.make_spill_dir
+
+    def spy_make_spill_dir(prefix: str) -> str:
+        directory = real_make_spill_dir(prefix)
+        captured["dir"] = directory
+        return directory
+
+    monkeypatch.setattr(operators_module, "make_spill_dir", spy_make_spill_dir)
+
+    result = {r["country"]: r for r in execute_partition(partial_exec, 0).to_list()}
+    assert len(result) == 10
+    assert "dir" in captured
+    assert not os.path.exists(captured["dir"])
