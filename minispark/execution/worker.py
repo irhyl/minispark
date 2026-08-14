@@ -32,6 +32,23 @@ exception, and reports which upstream stage_id was affected on the
 returned `TaskResult`. That is what lets execution/scheduler.py tell a
 task that needs its missing input recomputed apart from one that just
 needs to be retried in place (Milestone 6's lineage-based recovery).
+
+Profiling (Milestone 8): `cpu_time_seconds`/`peak_memory_bytes` on the
+returned `TaskMetrics` are filled in here via `psutil`, if it is
+installed; both stay `None` otherwise, exactly the state they were left
+in since Milestone 3. This is a different optional-dependency pattern
+than `storage/parquet.py`'s (pyarrow): that module is only imported when
+a caller actually uses Parquet, so its import can be deferred to inside
+those specific methods. `execute_task` runs unconditionally for *every*
+task regardless of what the query does, so there is no method boundary
+to defer behind; the import is instead attempted once at module load
+time and the module-level name is `None` on failure, with every use
+guarded by `if _psutil is not None`. `peak_memory_bytes` is this
+process's RSS at task completion, not a true peak (`psutil` does expose
+`memory_info().rss` continuously, but sampling it *during* execution
+would need a background thread polling concurrently with the task, not
+implemented); documented here rather than silently overstating what is
+measured.
 """
 
 from __future__ import annotations
@@ -57,6 +74,31 @@ from minispark.shuffle.partitioner import HashPartitioner, Partitioner, RangePar
 from minispark.shuffle.reader import MissingShuffleDataError
 from minispark.shuffle.writer import write_shuffle_partition
 
+try:
+    import psutil as _psutil
+except ImportError:
+    _psutil = None
+
+
+def _process_cpu_seconds() -> float | None:
+    if _psutil is None:
+        return None
+    times = _psutil.Process().cpu_times()
+    return times.user + times.system
+
+
+def _process_peak_memory_bytes() -> int | None:
+    if _psutil is None:
+        return None
+    return _psutil.Process().memory_info().rss
+
+
+def _cpu_delta(cpu_start: float | None) -> float | None:
+    if cpu_start is None:
+        return None
+    current = _process_cpu_seconds()
+    return None if current is None else current - cpu_start
+
 
 def execute_task(task: Task, attempt_number: int = 0) -> TaskResult:
     _context = TaskContext(
@@ -66,6 +108,7 @@ def execute_task(task: Task, attempt_number: int = 0) -> TaskResult:
         attempt_number=attempt_number,
     )
     start = time.perf_counter()
+    cpu_start = _process_cpu_seconds()
     try:
         if isinstance(task.plan, ShuffleWriteExec):
             result = _execute_shuffle_write_task(task)
@@ -76,7 +119,11 @@ def execute_task(task: Task, attempt_number: int = 0) -> TaskResult:
         return TaskResult(
             task_id=task.task_id,
             state=TaskState.FAILED,
-            metrics=TaskMetrics(execution_time_seconds=elapsed),
+            metrics=TaskMetrics(
+                execution_time_seconds=elapsed,
+                cpu_time_seconds=_cpu_delta(cpu_start),
+                peak_memory_bytes=_process_peak_memory_bytes(),
+            ),
             error=str(exc),
             missing_shuffle_stage_id=exc.stage_id,
         )
@@ -85,10 +132,16 @@ def execute_task(task: Task, attempt_number: int = 0) -> TaskResult:
         return TaskResult(
             task_id=task.task_id,
             state=TaskState.FAILED,
-            metrics=TaskMetrics(execution_time_seconds=elapsed),
+            metrics=TaskMetrics(
+                execution_time_seconds=elapsed,
+                cpu_time_seconds=_cpu_delta(cpu_start),
+                peak_memory_bytes=_process_peak_memory_bytes(),
+            ),
             error=f"{type(exc).__name__}: {exc}",
         )
     result.metrics.execution_time_seconds = time.perf_counter() - start
+    result.metrics.cpu_time_seconds = _cpu_delta(cpu_start)
+    result.metrics.peak_memory_bytes = _process_peak_memory_bytes()
     return result
 
 
