@@ -83,3 +83,47 @@ def test_only_the_failing_partition_is_retried():
     dataset = scheduler.run_stage(make_stage(3))
     assert sorted(r["x"] for r in dataset.iter_records()) == [0, 1, 2]
     assert attempts_by_partition == {0: 1, 1: 2, 2: 1}
+
+
+def test_last_metrics_is_none_before_any_run():
+    scheduler = LocalScheduler(num_workers=1)
+    assert scheduler.last_metrics is None
+
+
+def test_last_metrics_records_one_stage_with_correct_task_count():
+    def stub(task: Task, attempt: int) -> TaskResult:
+        return TaskResult(
+            task_id=task.task_id,
+            state=TaskState.SUCCESS,
+            rows=[{"x": task.partition_id}],
+            metrics=TaskMetrics(output_records=1, output_bytes=10),
+        )
+
+    scheduler = LocalScheduler(num_workers=1, run_task=stub)
+    scheduler.run_stage(make_stage(3))
+
+    metrics = scheduler.last_metrics
+    assert metrics is not None
+    assert len(metrics.stages) == 1
+    stage = metrics.stages[0]
+    assert stage.num_tasks == 3
+    assert stage.total_output_records == 3
+    assert stage.total_output_bytes == 30
+    assert stage.retried_tasks == 0
+    assert stage.recomputed is False
+    assert metrics.total_wall_clock_seconds >= 0
+
+
+def test_last_metrics_counts_retried_tasks_once_each():
+    def stub(task: Task, attempt: int) -> TaskResult:
+        if task.partition_id == 1 and attempt == 0:
+            return TaskResult(task_id=task.task_id, state=TaskState.FAILED, error="flaky")
+        return TaskResult(
+            task_id=task.task_id, state=TaskState.SUCCESS, rows=[{"x": task.partition_id}]
+        )
+
+    scheduler = LocalScheduler(num_workers=1, max_retries=1, run_task=stub)
+    scheduler.run_stage(make_stage(3))
+
+    stage = scheduler.last_metrics.stages[0]
+    assert stage.retried_tasks == 1
