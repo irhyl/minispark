@@ -47,6 +47,17 @@ path instead of recomputing forever). This only recovers data that was
 computed successfully once and then lost; it does not invent data that
 was never produced (a permanently unreadable source still fails the
 query, correctly).
+
+Metrics (Milestone 8): every `run_plan()` call builds one `QueryMetrics`
+(execution/metrics.py), one `StageMetrics` per stage *run* (a lineage
+recompute of a stage appends a second entry for the same stage_id, not a
+merge with the first, since both runs did real, separately measurable
+work), stored on `self.last_metrics`. This is a plain attribute, not part
+of `run_plan()`'s return value, specifically so the Dataset-only return
+type every existing caller already depends on does not change;
+`api/dataframe.py`'s `DataFrame._collect_dataset()` reads it off the
+scheduler right after calling `run_plan()` and exposes it as
+`DataFrame.last_run_metrics`.
 """
 
 from __future__ import annotations
@@ -54,6 +65,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import itertools
+import time
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 
@@ -61,6 +73,7 @@ from minispark.config.log import get_logger
 from minispark.core.dataset import Dataset
 from minispark.core.partition import Partition, PartitionMetadata
 from minispark.core.schema import Schema
+from minispark.execution.metrics import QueryMetrics, StageMetrics
 from minispark.execution.stages import Stage
 from minispark.execution.tasks import Task, TaskResult, TaskState
 from minispark.execution.worker import execute_task
@@ -98,6 +111,11 @@ class LocalScheduler:
         # importable, module-level callable when num_workers > 1: it is
         # sent to worker processes exactly like `execute_task` is.
         self._run_task = run_task or execute_task
+        # Set at the end of every run_plan() call; None until the first
+        # one. A plain attribute, not a return value, so DataFrame._
+        # collect_dataset() (api/dataframe.py) can read it after the fact
+        # without changing run_plan()'s existing Dataset-only return type.
+        self.last_metrics: QueryMetrics | None = None
 
     def run_stage(self, stage: Stage) -> Dataset:
         """Run a single stage. A thin wrapper around `run_plan([stage])`,
@@ -117,11 +135,14 @@ class LocalScheduler:
         # genuinely broken source, not a one-off loss) cannot make the
         # scheduler recompute it forever; see _try_recover_missing_shuffle.
         recomputed_stages: set[int] = set()
+        stage_metrics: list[StageMetrics] = []
+        run_start = time.perf_counter()
         try:
             final_dataset: Dataset | None = None
             for stage in stages:
                 results = self._run_stage(
-                    stage, shuffle_manager, task_ids, stages_by_id, recomputed_stages
+                    stage, shuffle_manager, task_ids, stages_by_id, recomputed_stages,
+                    stage_metrics, recomputed=False,
                 )
                 if not isinstance(stage.plan, ShuffleWriteExec):
                     final_dataset = _results_to_dataset(stage.plan.schema, results)
@@ -129,6 +150,9 @@ class LocalScheduler:
                 raise AssertionError("run_plan() received no stages")
             return final_dataset
         finally:
+            self.last_metrics = QueryMetrics(
+                stages=stage_metrics, total_wall_clock_seconds=time.perf_counter() - run_start
+            )
             shuffle_manager.cleanup()
 
     def _run_stage(
@@ -138,17 +162,30 @@ class LocalScheduler:
         task_ids: itertools.count,
         stages_by_id: dict[int, Stage],
         recomputed_stages: set[int],
+        stage_metrics: list[StageMetrics],
+        recomputed: bool,
     ) -> list[TaskResult]:
         """Run every task in `stage` and, if it is a shuffle-write stage,
         register the blocks its tasks produced. Used both for a stage's
         normal, once-per-query run (from `run_plan`) and for a lineage
         recomputation re-run of an upstream stage whose blocks were found
-        missing (from `_try_recover_missing_shuffle`); both cases need
-        exactly the same "run tasks, then register whatever it wrote"
-        behavior, so this is the one place that does it.
+        missing (from `_try_recover_missing_shuffle`, `recomputed=True`);
+        both cases need exactly the same "run tasks, then register
+        whatever it wrote" behavior, so this is the one place that does
+        it, appending one StageMetrics entry either way.
         """
-        results = self._run_stage_tasks(
-            stage, shuffle_manager, task_ids, stages_by_id, recomputed_stages
+        stage_start = time.perf_counter()
+        results, retried_tasks = self._run_to_completion(
+            stage, shuffle_manager, task_ids, stages_by_id, recomputed_stages, stage_metrics
+        )
+        stage_metrics.append(
+            StageMetrics.from_task_metrics(
+                stage_id=stage.stage_id,
+                metrics=[r.metrics for r in results],
+                wall_clock_seconds=time.perf_counter() - stage_start,
+                retried_tasks=retried_tasks,
+                recomputed=recomputed,
+            )
         )
         if isinstance(stage.plan, ShuffleWriteExec):
             blocks: list[ShuffleBlockMeta] = [b for r in results for b in r.shuffle_blocks]
@@ -156,14 +193,15 @@ class LocalScheduler:
             logger.info("ShuffleCompleted stage_id=%s blocks=%s", stage.stage_id, len(blocks))
         return results
 
-    def _run_stage_tasks(
+    def _run_to_completion(
         self,
         stage: Stage,
         shuffle_manager: ShuffleManager,
         task_ids: itertools.count,
         stages_by_id: dict[int, Stage],
         recomputed_stages: set[int],
-    ) -> list[TaskResult]:
+        stage_metrics: list[StageMetrics],
+    ) -> tuple[list[TaskResult], int]:
         tasks = [
             Task(
                 task_id=next(task_ids),
@@ -176,22 +214,9 @@ class LocalScheduler:
             for pid in range(stage.num_partitions)
         ]
         logger.info("StageStarted stage_id=%s tasks=%s", stage.stage_id, len(tasks))
-        results = self._run_to_completion(
-            tasks, shuffle_manager, task_ids, stages_by_id, recomputed_stages
-        )
-        logger.info("StageCompleted stage_id=%s", stage.stage_id)
-        return results
-
-    def _run_to_completion(
-        self,
-        tasks: list[Task],
-        shuffle_manager: ShuffleManager,
-        task_ids: itertools.count,
-        stages_by_id: dict[int, Stage],
-        recomputed_stages: set[int],
-    ) -> list[TaskResult]:
         pending: dict[int, tuple[Task, int]] = {t.task_id: (t, 0) for t in tasks}
         done: dict[int, TaskResult] = {}
+        retried_task_ids: set[int] = set()
         while pending:
             batch = list(pending.values())
             batch_results = self._run_batch(batch)
@@ -202,7 +227,8 @@ class LocalScheduler:
                     and result.missing_shuffle_stage_id is not None
                 ):
                     recovered = self._try_recover_missing_shuffle(
-                        task, result, shuffle_manager, task_ids, stages_by_id, recomputed_stages
+                        task, result, shuffle_manager, task_ids, stages_by_id,
+                        recomputed_stages, stage_metrics,
                     )
                     if recovered is not None:
                         # Not attempt + 1: the task itself did not fail on
@@ -218,6 +244,7 @@ class LocalScheduler:
                         attempt + 1,
                         result.error,
                     )
+                    retried_task_ids.add(task.task_id)
                     pending[task.task_id] = (task, attempt + 1)
                 else:
                     if result.state is TaskState.FAILED:
@@ -237,7 +264,7 @@ class LocalScheduler:
                 f"{self.max_retries} retries; first error "
                 f"(task_id={first.task_id}): {first.error}"
             )
-        return results
+        return results, len(retried_task_ids)
 
     def _try_recover_missing_shuffle(
         self,
@@ -247,6 +274,7 @@ class LocalScheduler:
         task_ids: itertools.count,
         stages_by_id: dict[int, Stage],
         recomputed_stages: set[int],
+        stage_metrics: list[StageMetrics],
     ) -> Task | None:
         """If `result` failed because an upstream stage's shuffle blocks
         were missing, and that stage has not already been recomputed once
@@ -271,7 +299,10 @@ class LocalScheduler:
             result.error,
         )
         recomputed_stages.add(missing_stage_id)
-        self._run_stage(missing_stage, shuffle_manager, task_ids, stages_by_id, recomputed_stages)
+        self._run_stage(
+            missing_stage, shuffle_manager, task_ids, stages_by_id, recomputed_stages,
+            stage_metrics, recomputed=True,
+        )
         fresh_blocks = _resolve_shuffle_blocks(task.plan, task.partition_id, shuffle_manager)
         return dataclasses.replace(task, shuffle_blocks=fresh_blocks)
 
