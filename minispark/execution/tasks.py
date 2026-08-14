@@ -99,3 +99,9 @@ class TaskResult:
     # execution/scheduler.py registers into the ShuffleManager so a
     # downstream stage's tasks know what to read.
     shuffle_blocks: list[ShuffleBlockMeta] = field(default_factory=list)
+    # Populated only when `state is FAILED` and the failure was a
+    # MissingShuffleDataError (shuffle/reader.py): which upstream stage's
+    # blocks were missing or corrupted. execution/scheduler.py reads this
+    # to decide whether a failure needs lineage-based stage recomputation
+    # instead of (or before) a plain in-place task retry.
+    missing_shuffle_stage_id: int | None = None
