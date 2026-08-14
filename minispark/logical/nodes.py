@@ -8,6 +8,7 @@ than stubbed out empty now.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Protocol
 
 from minispark.core.dataset import Dataset
 from minispark.core.schema import Field, Schema
@@ -15,6 +16,23 @@ from minispark.core.types import STRING, DataType
 from minispark.expressions.aggregate import AggregateFunction
 from minispark.expressions.base import Alias, Expression
 from minispark.expressions.column import Column
+
+
+class ScanSource(Protocol):
+    """Structural stand-in for `storage.datasource.DataSource`.
+
+    `logical/` deliberately never imports `storage/` (see `Scan`'s
+    docstring): the logical-plan layer only knows the data model
+    (`Dataset`) a source produces, not the storage layer's I/O code. A
+    `Protocol` lets `Scan` type-check and call `.read(columns=, filter=)`
+    on whatever `source` it was given without importing the concrete
+    `DataSource` class that satisfies it; any object with a matching
+    `read` method (every `DataSource` subclass already has one) works,
+    purely structurally, no inheritance or registration needed.
+    """
+
+    def read(self, columns: list[str] | None = None, filter: Expression | None = None) -> Dataset:
+        ...
 
 
 class LogicalPlan(ABC):
@@ -41,11 +59,23 @@ class Scan(LogicalPlan):
     The Dataset itself is lazy per-partition (see core/partition.py), so
     "already materialized" only means schema + partition boundaries are
     known — row data is still pulled on demand during execution.
+
+    `source`, when given, is the `ScanSource` (structurally, a
+    `storage.datasource.DataSource`) that produced `dataset`, kept around
+    so `physical/planner.py` can re-invoke `.read(columns=, filter=)` with
+    pushdown hints computed by the optimizer, discarding this Scan's
+    original, unpruned `dataset` in favor of a freshly, more narrowly read
+    one (see physical/planner.py's scan-pushdown pass). `None` (the
+    default, and the only option before Milestone 7) means this Scan
+    cannot be pushed into further: nothing re-reads it, it is used exactly
+    as built. A hand-built `Scan(dataset, name)` in a test, with no
+    `source`, still works exactly as it always has.
     """
 
-    def __init__(self, dataset: Dataset, source_name: str):
+    def __init__(self, dataset: Dataset, source_name: str, source: ScanSource | None = None):
         self.dataset = dataset
         self.source_name = source_name
+        self.source = source
 
     @property
     def schema(self) -> Schema:
