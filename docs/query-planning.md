@@ -1,6 +1,6 @@
 # Query Planning
 
-How a `DataFrame` call becomes rows, as of Milestone 5. There is no SQL yet
+How a `DataFrame` call becomes rows, as of Milestone 7. There is no SQL yet
 (Milestone 8); a SQL string will eventually parse into the same logical plan
 described here rather than getting its own execution path, per the build
 spec's "there must not be a separate SQL execution engine" rule.
@@ -77,6 +77,11 @@ comparison instead of `==`). The default rules, in order:
    determine what they need from their child(ren) (like `Project` does),
    so `needed` is replaced, not merged, at those nodes; `Sort` behaves
    like `Filter` (adds its sort keys to whatever was already needed).
+   Through Milestone 6 this only narrowed plan *shape* (smaller Record
+   dicts flowing through Filter/Project below `Scan`), not bytes read
+   from disk; Milestone 7's physical-planning-time scan-pushdown pass
+   (below) is what turns this rule's already-computed column set into an
+   actual, narrower read for a source that can honor it.
 5. **RedundantProjectionElimination**: removes a `Project` that turned
    out to be a no-op (its columns exactly match its child's schema), and
    collapses a plain-column `Project` sitting directly below another one.
@@ -115,20 +120,31 @@ run by `execution/scheduler.py`'s `LocalScheduler`, across a real
 `docs/execution-model.md` for the DAG/Stage/Task/Worker picture that sits
 between physical planning and rows.
 
-**`Sort` is the one place physical planning touches data.** Every other
-node above only rearranges plan *shape*. Choosing where to cut `order_by`'s
-sort key into `shuffle_partitions` ranges needs to know something about
-the data's range *before* the shuffle that needs those cut points runs,
-and there is no distributed sampling stage to compute that without
-touching data (see `docs/shuffle.md`). `physical/planner.py`'s
-`_sort_range_boundaries()` gets it by eagerly executing the child plan
-(via `physical/operators.py`'s whole-Dataset `execute()`, so only a
-Scan/Filter/Project child chain is supported, not one ending in `Aggregate`
-or `Join`) and scanning the sort key's min/max with
+**`Sort` and scan pushdown are the two places physical planning touches
+data.** Every other node above only rearranges plan *shape*. Choosing
+where to cut `order_by`'s sort key into `shuffle_partitions` ranges needs
+to know something about the data's range *before* the shuffle that needs
+those cut points runs, and there is no distributed sampling stage to
+compute that without touching data (see `docs/shuffle.md`). `physical/
+planner.py`'s `_sort_range_boundaries()` gets it by eagerly executing the
+child plan (via `physical/operators.py`'s whole-Dataset `execute()`, so
+only a Scan/Filter/Project child chain is supported, not one ending in
+`Aggregate` or `Join`) and scanning the sort key's min/max with
 `optimizer/statistics.py`'s `compute_statistics()`, right there in the
-planner. This is flagged loudly, in both code and here, because it is a
-real, deliberate exception to "building a plan never touches data," true
-of literally everything else in this file.
+planner.
+
+The second, added in Milestone 7: `_pushdown_scan_reads()` runs once,
+before any node translation, and re-reads any `Scan` whose `source` is
+set (see `logical/nodes.py`'s `ScanSource` Protocol) with the columns/
+filter its surrounding Project/Filter chain implies, so a source that
+can honor them (Parquet: real column pruning and row-group-level
+predicate pushdown; CSV/Memory/Checkpoint: real column pruning only)
+actually reads less. See `docs/columnar-storage.md` for exactly how the
+hints are computed and propagated, and for the "run once, not once per
+recursive call" fix a first version of this needed. Both of these are
+flagged loudly, in both code and here, because each is a real, deliberate
+exception to "building a plan never touches data," true of literally
+everything else in this file.
 
 ## `explain()`
 
@@ -140,6 +156,12 @@ Plan =="`, `"== Optimized Logical Plan =="`, `"== Physical Plan =="`, and
 `execution/stages.py`'s `build_stages()`), so the effect of each step,
 including how many stages a shuffle-heavy query actually splits into, is
 visible. See `examples/basic_dataframe.py` for a Milestone 1/2 example
-(constant folding, pushdown, and pruning all fire on one small query) and
+(constant folding, pushdown, and pruning all fire on one small query),
 `examples/aggregations.py` / `examples/joins.py` for Milestone 4/5
-examples that produce real multi-stage, multi-shuffle plans.
+examples that produce real multi-stage, multi-shuffle plans, and
+`examples/parquet.py` for a Milestone 7 example where the "Physical
+Plan" section's `ScanExec` visibly reads fewer columns than the source
+file has, the scan-pushdown pass's effect made directly visible (the
+"Optimized Logical Plan" section above it does not show this: pushdown
+happens at physical-planning time, one step later, see this document's
+"Physical planning and execution" section).
