@@ -22,6 +22,7 @@ from minispark.api.writer import DataFrameWriter
 from minispark.core.dataset import Dataset
 from minispark.core.record import Record
 from minispark.core.schema import Schema
+from minispark.execution.metrics import QueryMetrics
 from minispark.execution.scheduler import LocalScheduler
 from minispark.execution.stages import Stage, build_stages
 from minispark.expressions.base import Expression
@@ -41,6 +42,7 @@ class DataFrame:
     def __init__(self, session: MiniSparkSession, plan: LogicalPlan):
         self._session = session
         self._plan = plan
+        self._last_metrics: QueryMetrics | None = None
 
     @property
     def schema(self) -> Schema:
@@ -131,12 +133,29 @@ class DataFrame:
         `checkpoint()`, and `DataFrameWriter.parquet()` (api/writer.py):
         every one of them needs "run the plan, get the rows back", and
         `checkpoint()`/`write.parquet()` specifically need the per-
-        partition split preserved, not merged.
+        partition split preserved, not merged. Also captures the
+        scheduler's aggregated metrics for this run into `self.
+        _last_metrics`, readable afterward via `last_run_metrics`.
         """
-        return self._scheduler().run_plan(self._stages())
+        scheduler = self._scheduler()
+        dataset = scheduler.run_plan(self._stages())
+        self._last_metrics = scheduler.last_metrics
+        return dataset
 
     def collect(self) -> list[Record]:
         return list(self._collect_dataset().iter_records())
+
+    @property
+    def last_run_metrics(self) -> QueryMetrics | None:
+        """Aggregated per-stage metrics (task counts, wall-clock time,
+        rows, bytes, shuffle bytes, retries, and, if `psutil` is
+        installed, CPU time and peak memory) from the most recent action
+        run on this DataFrame (`collect`/`show`/`count`/`checkpoint`/
+        `write.parquet`). `None` until an action has actually run:
+        unlike `explain()`, which only ever describes a plan, this
+        describes what *happened*, and nothing has happened yet.
+        """
+        return self._last_metrics
 
     def checkpoint(self, directory: str | None = None) -> DataFrame:
         """Run this DataFrame now and durably materialize the result to
