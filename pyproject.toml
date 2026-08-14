@@ -14,8 +14,12 @@ dependencies = []
 # Milestone 1 has zero third-party runtime dependencies on purpose: the
 # data model, expressions, logical plan, naive executor, and CSV reader
 # are all built on the standard library. pyarrow/pandas/duckdb/psutil are
-# introduced later (columnar execution, benchmarking, validation) and are
-# declared as optional extras so they are only installed when actually used.
+# introduced later and are declared as optional extras so they are only
+# installed when actually used. `columnar` (pyarrow) is the first of
+# these actually consumed: Milestone 7's storage/parquet.py is the only
+# module that imports it, and even that module's callers import it
+# lazily, so installing every other extra, or none at all, still leaves
+# every non-Parquet feature fully usable with zero third-party deps.
 [project.optional-dependencies]
 columnar = ["pyarrow>=15"]
 interop = ["pandas>=2", "numpy>=1.26"]
