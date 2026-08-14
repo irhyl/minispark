@@ -32,7 +32,11 @@ from minispark.physical.plan import (
     ShuffleReadExec,
     SortExec,
 )
-from minispark.shuffle.reader import read_shuffle_blocks
+from minispark.shuffle.reader import (
+    MissingShuffleDataError,
+    ShuffleChecksumError,
+    read_shuffle_blocks,
+)
 from minispark.shuffle.writer import ShuffleBlockMeta
 
 # Keyed by source stage_id: a Task whose plan reads from more than one
@@ -253,7 +257,16 @@ def _execute_shuffle_read_partition(
             "(see execution/worker.py, execution/scheduler.py)."
         )
     blocks = shuffle_blocks[plan.from_stage_id]
-    records = list(read_shuffle_blocks(blocks))
+    try:
+        records = list(read_shuffle_blocks(blocks))
+    except (FileNotFoundError, ShuffleChecksumError) as exc:
+        # A block file this partition needs is gone or corrupted: retrying
+        # this same read can never succeed, since the data simply is not
+        # there any more. Re-raised as a distinct error type so
+        # execution/worker.py and execution/scheduler.py can tell "the
+        # upstream stage needs to be recomputed" apart from an ordinary,
+        # possibly-transient task failure.
+        raise MissingShuffleDataError(plan.from_stage_id, partition_id, str(exc)) from exc
     return Partition(
         partition_id,
         plan.schema,
