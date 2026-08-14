@@ -14,6 +14,7 @@ correctness oracles other tests check the real path against.
 
 from __future__ import annotations
 
+import tempfile
 from typing import TYPE_CHECKING
 
 from minispark.api.grouped import GroupedData
@@ -24,10 +25,11 @@ from minispark.execution.stages import Stage, build_stages
 from minispark.expressions.base import Expression
 from minispark.expressions.column import Column
 from minispark.logical.analyzer import analyze
-from minispark.logical.nodes import Filter, Join, LogicalPlan, Project, Sort
+from minispark.logical.nodes import Filter, Join, LogicalPlan, Project, Scan, Sort
 from minispark.logical.plan import explain_string
 from minispark.optimizer.optimizer import Optimizer, default_rules
 from minispark.physical.planner import plan_physical
+from minispark.storage.checkpoint import CheckpointDataSource, write_checkpoint
 
 if TYPE_CHECKING:
     from minispark.api.session import MiniSparkSession
@@ -123,6 +125,39 @@ class DataFrame:
     def collect(self) -> list[Record]:
         dataset = self._scheduler().run_plan(self._stages())
         return list(dataset.iter_records())
+
+    def checkpoint(self, directory: str | None = None) -> DataFrame:
+        """Run this DataFrame now and durably materialize the result to
+        local disk, returning a new DataFrame that scans it back.
+
+        Unlike `collect()`, which pulls rows into a Python list the caller
+        owns, the returned DataFrame's plan is a fresh `Scan` over the
+        checkpoint directory: everything in *this* DataFrame's plan (every
+        Filter/Project/Join/Aggregate/Sort that built it) is gone from the
+        new plan, replaced by a single leaf that reads the checkpoint
+        back from disk. That is what "truncates lineage" means here: if a
+        downstream query built on the returned DataFrame ever needs to
+        recompute this data (see execution/scheduler.py's lineage-based
+        recovery), it re-reads the checkpoint, not the original
+        (possibly much more expensive) computation.
+
+        `directory` defaults to a fresh directory under the system temp
+        directory; pass an explicit path (e.g. under `checkpoints/`,
+        already reserved in this repo's `.gitignore`) for one that
+        survives past a single temp-directory lifetime. Either way,
+        nothing here deletes a checkpoint directory automatically: unlike
+        the shuffle scratch directory (cleaned up at the end of every
+        query, see shuffle/manager.py), a checkpoint is meant to
+        outlive the query that wrote it, so there is no safe automatic
+        point to remove it from. Managing that lifetime (deleting old
+        checkpoints) is left to the caller; there is no garbage collector
+        for them yet.
+        """
+        dataset = self._scheduler().run_plan(self._stages())
+        target = directory or tempfile.mkdtemp(prefix="minispark-checkpoint-")
+        write_checkpoint(dataset, target)
+        checkpointed = CheckpointDataSource(target).read()
+        return DataFrame(self._session, Scan(checkpointed, source_name=f"checkpoint:{target}"))
 
     def count(self) -> int:
         dataset = self._scheduler().run_plan(self._stages())
