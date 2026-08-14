@@ -93,6 +93,16 @@ def test_recomputes_missing_upstream_stage_and_then_succeeds():
     # Stage 1's one task failed once, then succeeded once, after recovery.
     assert calls["stage1"] == 2
 
+    # The recompute shows up as its own, separately measured StageMetrics
+    # entry (Milestone 8), not folded into stage 0's normal-run entry.
+    metrics = scheduler.last_metrics
+    stage0_runs = [s for s in metrics.stages if s.stage_id == 0]
+    assert len(stage0_runs) == 2
+    assert sorted(s.recomputed for s in stage0_runs) == [False, True]
+    stage1_runs = [s for s in metrics.stages if s.stage_id == 1]
+    assert len(stage1_runs) == 1
+    assert stage1_runs[0].recomputed is False
+
 
 def test_a_stage_is_recomputed_at_most_once_per_run():
     calls = {"stage0": 0, "stage1": 0}
