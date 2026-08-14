@@ -9,7 +9,7 @@ an accompanying, actually-run benchmark (see `docs/benchmarks.md`; every
 number there was measured on a real machine, not invented, including results
 that do not flatter the design).
 
-## Status: Milestone 8
+## Status
 
 Implemented so far:
 
@@ -123,15 +123,28 @@ Implemented so far:
   `physical/operators.py`'s whole-Dataset `execute()`: earlier
   milestones' execution paths, kept only as correctness oracles other
   tests check the real path against.
+- **Spilling and memory-aware execution** (`minispark/physical/spill.py`,
+  `docs/spilling.md`): `SortExec` (external merge sort) and
+  `HashAggregateExec` (grace-hash partitioned spilling) both spill to
+  local disk once their in-memory buffer crosses `MemoryConfig.
+  spill_threshold_bytes`, instead of growing it without bound; both are
+  byte-for-byte identical to their pre-Milestone-9 behavior when the
+  threshold is never crossed (the default). `CSVDataSource` now records
+  a byte offset per partition so each one seeks straight to its own row
+  range instead of re-parsing every row before it. `benchmarks/skew.py`
+  and `benchmarks/spilling.py` measure, respectively, data skew's effect
+  on a reduce stage and spilling's real wall-clock cost (see
+  `docs/benchmarks.md`).
 
 Not implemented yet (by design, not oversight): left/right/full outer or
 semi/anti joins, differently-named join keys, sort-merge join,
-cost-based join strategy selection, and performance optimization/skew/
-spilling and remote-worker architecture readiness (Milestones 9 and 10).
-Every one of those has a numbered section in the build spec this project
-follows and lands in its own milestone (or, for the join-scope items, is
-an explicit, documented simplification of Milestone 5's own scope, see
-`logical/nodes.py`'s `Join` docstring). Within what Milestone 6 does
+cost-based join strategy selection, and remote-worker architecture
+readiness (real network communication and cloud deployment). Every one
+of those has a numbered section in the build spec this project follows
+and lands in its own milestone (or,
+for the join-scope items, is an explicit, documented simplification of
+Milestone 5's own scope, see `logical/nodes.py`'s `Join` docstring).
+Within what Milestone 6 does
 cover: lineage-based recomputation is stage-granular (a lost partition is
 recovered by recomputing its entire upstream stage, not just the
 specific tasks that produced it) and capped at one recompute per stage
@@ -152,7 +165,17 @@ has no subqueries/`UNION`/window functions/`LIMIT`/CTEs/UDFs, and a
 `peak_memory_bytes` is a task's RSS at completion, not a continuously
 sampled true peak; and the benchmark scripts in `benchmarks/` are
 single-trial, uncontrolled measurements on one development machine, not
-a reproducible, isolated benchmark suite.
+a reproducible, isolated benchmark suite. For spilling and CSV
+byte-offset seeking (see `docs/spilling.md`): grace-hash aggregate
+spilling bounds memory but not time per bucket, so one hash bucket
+holding a
+disproportionate share of distinct keys (skew) is measured
+(`benchmarks/skew.py`) but not mitigated; a spill resets the whole
+in-memory table, not just the excess, which is why spilling measurably
+costs more for `group_by` than for `order_by` (`docs/benchmarks.md`);
+and CSV byte-offset seeking does not correctly handle a quoted field
+containing a literal embedded newline (misparses or raises
+`ValueError`, see `storage/csv.py`).
 
 ## Quick start
 
@@ -173,6 +196,8 @@ python examples/parquet.py
 python -m benchmarks.scaling
 python -m benchmarks.join_strategy
 python -m benchmarks.csv_vs_parquet   # needs the columnar extra above
+python -m benchmarks.skew
+python -m benchmarks.spilling
 ```
 
 ```python
@@ -206,9 +231,11 @@ boundary (partial aggregation, hash partitioning, the on-disk block
 format shared by shuffle blocks and checkpoints), `docs/columnar-storage.md`
 for Parquet reading/writing, real column pruning, and real predicate
 pushdown, `docs/sql.md` for exactly what SQL is and is not supported and
-why, and `docs/benchmarks.md` for real, actually-measured numbers (and
-their caveats) on `local[N]` scaling, CSV vs. Parquet, and broadcast vs.
-shuffle joins.
+why, `docs/spilling.md` for how `order_by`/`group_by` spill to local
+disk under memory pressure and the CSV byte-offset read optimization,
+and `docs/benchmarks.md` for real, actually-measured numbers (and their
+caveats) on `local[N]` scaling, CSV vs. Parquet, broadcast vs. shuffle
+joins, data skew, and spilling.
 
 ## Development
 
