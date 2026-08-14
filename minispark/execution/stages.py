@@ -119,10 +119,17 @@ def _with_child(plan: PhysicalPlan, new_child: PhysicalPlan) -> PhysicalPlan:
         return ProjectExec(new_child, plan.columns, plan.schema)
     if isinstance(plan, HashAggregateExec):
         return HashAggregateExec(
-            new_child, plan.group_by, plan.aggregates, plan.schema, plan.is_partial
+            new_child,
+            plan.group_by,
+            plan.aggregates,
+            plan.schema,
+            plan.is_partial,
+            plan.spill_threshold_bytes,
         )
     if isinstance(plan, SortExec):
-        return SortExec(new_child, plan.sort_exprs, plan.ascending, plan.schema)
+        return SortExec(
+            new_child, plan.sort_exprs, plan.ascending, plan.schema, plan.spill_threshold_bytes
+        )
     raise NotImplementedError(
         f"Cannot rebuild physical node {type(plan).__name__} with a new child"
     )
