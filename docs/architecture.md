@@ -33,7 +33,7 @@ Task Execution
 Storage / Shuffle
 ```
 
-**Milestone 5 status**: every layer above is implemented. `DataFrame`
+**Milestone 6 status**: every layer above is implemented. `DataFrame`
 actions (`collect`/`show`/`count`/`explain`) run, in order:
 `logical/analyzer.py` (validates the plan), `optimizer/optimizer.py`
 (rewrites it), `physical/planner.py` (translates it to a physical plan,
@@ -139,10 +139,13 @@ equivalent unoptimized plan.
   only.
 
 - **`minispark/storage/`** — `DataSource` (abstract), `MemoryDataSource`,
-  `CSVDataSource`. Depends only on `core/`. A `Scan` logical node holds an
-  already-`.read()` `Dataset`, not a `DataSource` reference — so the
-  logical-plan layer never imports the storage layer's I/O code, only the
-  data model it produces.
+  `CSVDataSource`, and, as of Milestone 6, `CheckpointDataSource`/
+  `write_checkpoint()` (reads back a `Dataset` durably materialized to
+  local disk by `DataFrame.checkpoint()`, reusing the same pickled-record
+  block format as a shuffle block, see `docs/shuffle.md`). Depends only
+  on `core/`. A `Scan` logical node holds an already-`.read()` `Dataset`,
+  not a `DataSource` reference, so the logical-plan layer never imports
+  the storage layer's I/O code, only the data model it produces.
 
 - **`minispark/execution/`**: `executor.py` (Milestone 1's naive
   logical-plan interpreter, kept only as a correctness oracle), `dag.py`,
@@ -154,8 +157,12 @@ equivalent unoptimized plan.
 - **`minispark/api/`** — `DataFrame` (lazy; `filter`/`select`/`group_by`/
   `join`/`order_by` (alias `sort`) build plan nodes, `collect`/`show`/
   `count`/`explain` are the only things that trigger analysis/
-  optimization/execution), `grouped.py` (`GroupedData`, the result of
-  `group_by()` before `.agg()` turns it back into a `DataFrame`),
+  optimization/execution; `checkpoint()`, as of Milestone 6, also
+  triggers execution, eagerly, and returns a new `DataFrame` whose plan
+  is a fresh `Scan` over the durably-materialized result, see Key
+  Milestone-6 design decisions below), `grouped.py` (`GroupedData`, the
+  result of `group_by()` before `.agg()` turns it back into a
+  `DataFrame`),
   `MiniSparkSession` (+ builder), `functions.py` (`col()`, `lit()`,
   `count()`, `sum()`, `avg()`, `min()`, `max()`). `DataFrame.join()`
   intentionally only accepts `on=` (common column names on both sides),
@@ -182,6 +189,89 @@ equivalent unoptimized plan.
   `docs/shuffle.md`'s Sort section for when it falls back to one
   partition instead). `execution.partition_size_mb`, `execution.
   shuffle_compression`, and `memory` are still unread.
+
+## Key Milestone-6 design decisions
+
+**Retry and lineage-based recomputation are different mechanisms for
+different failure classes, not one generalized "recover from failure"
+system.** Milestone 3's task retry re-runs a task in place with the same
+inputs; that is correct for a transient failure but cannot help when the
+input itself is gone. Milestone 6 adds a second, narrower mechanism only
+for that second case: `physical/operators.py` distinguishes "a shuffle
+block is unreadable" (`MissingShuffleDataError`, wrapping a
+`FileNotFoundError` or a `ShuffleChecksumError`) from every other
+exception, threads that distinction through `TaskResult.
+missing_shuffle_stage_id`, and `execution/scheduler.py`'s
+`_try_recover_missing_shuffle` recomputes only the specific upstream
+stage that produced the missing data before retrying, rather than
+either (a) blindly retrying the same doomed read or (b) recomputing the
+entire query from Scan. Keeping these as two separate, composable
+mechanisms (ordinary retry still runs first/underneath; recomputation
+only fires for this one specific, identifiable failure signature) was
+chosen over one unified "just retry harder" loop because the two
+failures need genuinely different responses, and conflating them would
+mean either wasting work retrying an unrecoverable read forever, or
+recomputing a whole upstream stage for a merely transient hiccup that a
+plain retry would have fixed for free.
+
+**Recomputation is stage-granular, matching what this architecture can
+actually know, not the finest grain possible in principle.** A lost
+target partition could in principle be recovered by re-running only the
+specific source tasks that wrote to it (a real per-source-task
+map-output tracker, closer to how a mature Spark deployment behaves).
+`ShuffleManager` here only ever records "these blocks exist for this
+stage," not "this specific source task, of this specific stage, wrote
+to this specific target partition, and no other source task did," so
+the information needed for finer-grained recovery is not tracked. Rather
+than adding that tracking now, `_try_recover_missing_shuffle` recomputes
+the *entire* upstream stage (every task, every target partition) and
+re-registers all of it, a real, accepted cost (recomputing partitions
+that were not actually lost) in exchange for not needing a second
+bookkeeping structure alongside `ShuffleManager`'s existing one. Bounded
+to at most one recompute per stage per `run_plan()` call (a `set` of
+already-recomputed stage_ids threaded through the run) specifically so a
+stage that is not actually recoverable (a permanently broken source, not
+a one-off lost block) fails cleanly with `TaskExecutionError` instead of
+the scheduler looping on it.
+
+**There is no distinct "lost worker" failure domain to simulate, so this
+milestone simulates a lost *block* instead.** In a real multi-machine
+cluster, the motivating scenario for lineage-based recovery is an
+executor process (and the shuffle data cached on its local disk) dying
+outright. On one machine, every shuffle block for a query already lives
+under one shared scratch directory (`ShuffleManager.root_dir`, a single
+`tempfile.mkdtemp()`), not on a per-worker local disk the way a real
+cluster's executors would have; there is no separate failure domain
+"losing one worker" could correspond to here that "losing one file"
+does not already cover. `tests/integration/test_lineage_recovery_e2e.py`
+therefore simulates the failure the architecture can actually produce: a
+real shuffle block file deleted from real disk mid-query, under real
+`local[2]` multiprocessing, confirmed recoverable by the scheduler
+alone. This is flagged explicitly rather than claiming this proves
+executor-loss recovery in the distributed sense, it proves recovery from
+lost *data*, which is the part of the mechanism that generalizes; true
+multi-machine executor loss is Milestone 10 territory (remote worker
+architecture readiness).
+
+**Checkpointing reuses the shuffle block format instead of inventing a
+second on-disk record format.** `storage/checkpoint.py` writes one file
+per partition as back-to-back pickled Records, exactly `shuffle/
+writer.py`'s block format minus the checksum and `ShuffleBlockMeta`
+(a checkpoint is not registered with a `ShuffleManager` and is not
+verified against a checksum on read, since, unlike a shuffle block, it
+is not expected to be deleted out from under a running query). The
+alternative, a columnar/Parquet-backed checkpoint format, was set aside
+for Milestone 7, which introduces columnar execution generally; adding
+it only for checkpoints now would mean solving that problem twice.
+
+**`DataFrame.checkpoint()` returns a new `DataFrame`, it does not mutate
+the one it was called on.** This matches how every other `DataFrame`
+method (`filter`, `select`, `join`, ...) behaves, immutable, plan-
+building, never touching `self`, rather than making `checkpoint()` a
+special exception that mutates a DataFrame's own plan in place. The
+returned `DataFrame`'s plan is a bare `Scan` over a fresh
+`CheckpointDataSource`; nothing about the original `DataFrame` (still
+usable, still describing the original, uncheckpointed plan) changes.
 
 ## Key Milestone-5 design decisions
 
@@ -452,21 +542,28 @@ used as dict/set keys for value equality.
 
 ## What's deliberately not here yet
 
-Per the build spec's milestone breakdown: lineage-based fault recovery,
-checkpointing, columnar execution, SQL, and benchmarking. Each has a
-numbered section in the build spec and lands in the milestone assigned to
-it, see `README.md`'s status section for the current cut line. Within
-what Milestone 5 does cover: `Join` only supports `how="inner"` with
-common-named `on=` columns (no left/right/full outer, no semi/anti, no
-differently-named join keys); there is no sort-merge join, only hash join
-(broadcast or shuffled); broadcast-vs-shuffle join selection is an
-explicit hint, never automatic; `order_by()`'s range partitioning is
-equal-width over the observed min/max, not equal-row-count from a real
-sample, and only exists for numeric sort keys (a string key still sorts
-correctly, just through a single, non-parallel shuffle partition). The
-scheduler exists and retries individual task failures, and a real shuffle
-exists (now used by three different operators), but nothing recomputes a
-*lost* partition via lineage (Milestone 6), nothing spills an in-progress
+Per the build spec's milestone breakdown: columnar execution, SQL, and
+benchmarking. Each has a numbered section in the build spec and lands in
+the milestone assigned to it, see `README.md`'s status section for the
+current cut line. Within what Milestone 5 does cover: `Join` only
+supports `how="inner"` with common-named `on=` columns (no left/right/
+full outer, no semi/anti, no differently-named join keys); there is no
+sort-merge join, only hash join (broadcast or shuffled); broadcast-vs-
+shuffle join selection is an explicit hint, never automatic;
+`order_by()`'s range partitioning is equal-width over the observed
+min/max, not equal-row-count from a real sample, and only exists for
+numeric sort keys (a string key still sorts correctly, just through a
+single, non-parallel shuffle partition). Within what Milestone 6 does
+cover (see Key Milestone-6 design decisions, below, and
+`docs/execution-model.md`'s "Lineage-based recomputation" and
+"Checkpointing" sections for the full picture): lineage-based
+recomputation is stage-granular, not per-source-task, a lost target
+partition's data is recovered by recomputing its entire upstream stage,
+not just the specific tasks that wrote to it; a stage is recomputed at
+most once per query, a source that is genuinely, permanently unreadable
+still fails the query; and nothing manages checkpoint directory
+lifetime automatically, `DataFrame.checkpoint()` never deletes an old
+checkpoint, that is left to the caller. Nothing spills an in-progress
 aggregate's hash table or sort buffer to disk under memory pressure
 (Milestone 9), and shuffle output is never compressed
 (`ExecutionConfig.shuffle_compression` exists but is unread).
