@@ -17,6 +17,15 @@ Reuses the same on-disk record format as a shuffle block (back-to-back
 pickle, not newline-delimited JSON) rather than inventing a second
 format for what is structurally the same problem: durably persist a
 sequence of Records and read them back exactly.
+
+`read(columns=...)` projects each record to the requested keys after
+unpickling it: real in the sense that smaller dicts flow through the rest
+of the engine, but not I/O pruning, a checkpoint file has no per-column
+structure to skip reading, unlike Parquet's column chunks (see
+storage/parquet.py). `filter` is accepted for interface uniformity but
+not honored, matching storage/memory.py's reasoning: there is no
+statistics or storage-level structure here for a filter to skip work
+against.
 """
 
 from __future__ import annotations
@@ -31,6 +40,7 @@ from minispark.core.dataset import Dataset
 from minispark.core.partition import Partition, PartitionMetadata
 from minispark.core.record import Record
 from minispark.core.schema import Schema
+from minispark.expressions.base import Expression
 from minispark.storage.datasource import DataSource
 
 _META_FILENAME = "_meta.pkl"
@@ -47,7 +57,7 @@ def _partition_path(directory: Path, partition_id: int) -> Path:
     return directory / f"partition_{partition_id}.pkl"
 
 
-def _read_checkpoint_partition(path: str) -> Iterator[Record]:
+def _read_checkpoint_partition(path: str, columns: list[str] | None) -> Iterator[Record]:
     """Module-level, not a nested closure, so `CheckpointDataSource.read()`
     can bind it with `functools.partial` into a picklable `records_fn`
     (see storage/memory.py's `_make_records_fn` for the same constraint
@@ -58,9 +68,13 @@ def _read_checkpoint_partition(path: str) -> Iterator[Record]:
     with open(path, "rb") as f:
         while True:
             try:
-                yield pickle.load(f)
+                record = pickle.load(f)
             except EOFError:
                 break
+            if columns is None:
+                yield record
+            else:
+                yield {name: record[name] for name in columns}
 
 
 def write_checkpoint(dataset: Dataset, directory: str) -> None:
@@ -101,14 +115,15 @@ class CheckpointDataSource(DataSource):
     def name(self) -> str:
         return f"checkpoint:{self._directory}"
 
-    def read(self) -> Dataset:
-        schema: Schema = self._schema
+    def read(self, columns: list[str] | None = None, filter: Expression | None = None) -> Dataset:
+        full_schema: Schema = self._schema
+        schema = full_schema.select(columns) if columns is not None else full_schema
         parts: list[CheckpointPartitionMeta] = self._parts
         partitions = [
             Partition(
                 partition_id=p.partition_id,
                 schema=schema,
-                records_fn=functools.partial(_read_checkpoint_partition, p.path),
+                records_fn=functools.partial(_read_checkpoint_partition, p.path, columns),
                 metadata=PartitionMetadata(location=p.path, row_count=p.row_count),
             )
             for p in parts
