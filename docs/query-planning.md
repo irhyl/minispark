@@ -1,13 +1,19 @@
 # Query Planning
 
-How a `DataFrame` call becomes rows, as of Milestone 7. There is no SQL yet
-(Milestone 8); a SQL string will eventually parse into the same logical plan
-described here rather than getting its own execution path, per the build
+How a `DataFrame` call becomes rows, as of Milestone 8. As of this
+milestone there are two ways to build the logical plan this document
+covers, `DataFrame` API chaining, and `session.sql(...)` (`sql/parser.py`,
+see `docs/sql.md`), which parses SQL text into exactly the same logical
+plan nodes rather than getting its own execution path, per the build
 spec's "there must not be a separate SQL execution engine" rule.
+Everything below this point (analysis, optimization, physical planning,
+scan pushdown, stage splitting, scheduled execution) applies identically
+regardless of which path built the plan.
 
 ```
-DataFrame API (filter/select/group_by/join/order_by)
-        |
+DataFrame API (filter/select/group_by/join/order_by)  session.sql("SELECT ...")
+                        \                                    /
+                         \                                  /
 Logical Plan          (logical/nodes.py: Scan, Filter, Project, Aggregate, Join, Sort)
         |
 Analyzer               (logical/analyzer.py: analyze())
@@ -164,4 +170,10 @@ Plan" section's `ScanExec` visibly reads fewer columns than the source
 file has, the scan-pushdown pass's effect made directly visible (the
 "Optimized Logical Plan" section above it does not show this: pushdown
 happens at physical-planning time, one step later, see this document's
-"Physical planning and execution" section).
+"Physical planning and execution" section), and `examples/sql.py` for a
+Milestone 8 example proving a SQL-built `DataFrame` explains exactly
+like any other, join, group by, having, and order by all included in
+one query. `explain()` never executes anything, before or after
+Milestone 8: `DataFrame.last_run_metrics` (see docs/execution-model.md's
+"Metrics and profiling") is the separate, only-after-an-action-actually-
+runs mechanism for seeing what a query *did*, not what it *would* do.
