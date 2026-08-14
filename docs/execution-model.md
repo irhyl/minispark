@@ -288,6 +288,28 @@ available after an action has actually run, mirroring how real Spark's
 execution metrics come from the Spark UI/status tracker after a job
 runs, not from `df.explain()`.
 
+## Spilling
+
+`SortExec` and `HashAggregateExec` both accumulate an in-memory buffer (a
+sort buffer, a hash-aggregate table) whose size would otherwise be
+unbounded, correct only for a partition small enough to fit in memory.
+Both carry a `spill_threshold_bytes` (sourced from `MemoryConfig.
+spill_threshold_bytes`, threaded through `physical/planner.py`, see
+`docs/architecture.md`'s Key spilling and CSV byte-offset design
+decisions): crossing it moves part of the buffer to a local-disk spill
+file (`physical/spill.py`) instead of growing further. See
+`docs/spilling.md` for the full design, including a real correctness bug
+(sort-tie ordering, fixed by tagging every record with a sequence number)
+found by testing, and `docs/benchmarks.md`'s
+"Spilling: what does it cost?" for the measured slowdown spilling
+actually costs on this machine (1.83x for a spilling sort, 3.16x for a
+spilling grace-hash aggregate). This is entirely inside one `Task`'s own
+`execute_partition()` call, not a scheduler- or stage-level concern:
+`LocalScheduler`/`execution/stages.py` above are unaware a task spilled
+at all, and no new `TaskMetrics` field currently reports it (spilling is
+observable today only via wall-clock time and, indirectly, via
+`docs/benchmarks.md`'s dedicated benchmark, not via `QueryMetrics`).
+
 ## What this is not, yet
 
 No DAG scheduler in the Spark sense (stage retries, speculative execution,
