@@ -136,12 +136,115 @@ writing and reading shuffle blocks for *both* the 200,000-row fact table
 and the 500-row dimension table, while the broadcast join only pays that
 cost for the 500-row side, leaving the fact table completely unshuffled.
 
+## Data skew: does one dominant key hurt the reduce stage?
+
+`benchmarks/skew.py` (measurement-only, not a fix, see the script's own
+docstring): `group_by(key).agg(count(*))` over 4,000,000
+rows, 200 distinct keys, 8 shuffle partitions, run twice, once with rows
+spread evenly across all 200 keys ("balanced") and once with 85% of all
+rows sharing a single key ("skewed"). `HashPartitioner` sends every row
+for a given key to the same reduce task, so the skewed run forces one of
+the 8 reduce tasks to merge far more partial state than the other seven.
+Run under both `local[1]` (sequential, no `ProcessPoolExecutor` spawn
+cost to confound the measurement) and `local[16]`, reading each run's
+reduce-stage `StageMetrics` directly (`wall_clock_seconds` and
+`total_execution_time_seconds`, not a manually-timed `collect()` call,
+which would span both the map and reduce stages together).
+
+```
+             run |  reduce wall |  reduce task-sum | reduce tasks | mean task time
+------------------------------------------------------------------------------------
+local[1]/balanced |       0.093s |           0.092s |            8 |         0.012s
+ local[1]/skewed |       0.165s |           0.164s |            8 |         0.020s
+local[16]/balanced |       0.568s |           0.129s |            8 |         0.016s
+local[16]/skewed |       0.571s |           0.187s |            8 |         0.023s
+```
+
+**Under `local[1]`, reduce-stage wall clock tracked the skew almost
+exactly** (0.093s -> 0.165s, a 1.77x increase, matching mean task time's
+1.77x increase): with no parallelism to hide behind, wall clock *is* the
+task-time sum, so the one overloaded reduce task's extra merge work shows
+up directly in how long the whole stage takes.
+
+**Under `local[16]`, reduce-stage wall clock barely moved** (0.568s ->
+0.571s, effectively flat) even though mean task time still grew 1.45x
+(0.016s -> 0.023s): consistent with the "`local[1]` vs `local[N]`"
+section above, per-stage `ProcessPoolExecutor` spawn cost on this
+Windows/spawn machine (roughly half a second here) is large enough at
+this task size to swamp the real, underlying compute-time skew, which is
+only visible once that overhead is removed, i.e. under `local[1]`. This
+is not a flaw in the skew experiment; it is the same measured overhead
+this page already documents, now shown to also mask a *different* real
+effect (skew) when the two are combined at a small-enough task size.
+
+**Why the multiplier is modest (1.77x, not close to the 0.85 / 0.15 ≈
+5.7x row-count skew).** The reduce stage does not process raw rows: by
+the time data reaches it, Milestone 4's map-side partial aggregation has
+already collapsed each source partition's rows into one partial count
+per (partition, key) pair, per `physical/operators.py`'s
+`_execute_hash_aggregate_partition`. What the skewed reduce task
+actually does more of is merge more partial states and finalize more
+result rows for its one dominant key, not iterate 5.7x more raw rows;
+the row-count skew is real, but partial aggregation absorbs most of its
+cost before the reduce side ever sees it. This is expected, not a
+measurement error, and is itself worth knowing: it means partial
+aggregation (already implemented since Milestone 4) is doing real,
+unplanned-for-this-benchmark work reducing skew's impact, on top of its
+original purpose of shrinking shuffle volume.
+
+## Spilling: what does it cost?
+
+`benchmarks/spilling.py`: the same `order_by(value)` (2,000,000 rows) and
+`group_by(key).agg(count(*))` (2,000,000 rows, 500,000 distinct keys)
+queries, each run twice under `local[1]` (isolating spilling's own cost
+from the `ProcessPoolExecutor` overhead measured elsewhere on this page):
+once with the default `MemoryConfig` (`spill_threshold_bytes` ~= 3.4 GB,
+effectively never crossed at this data size, so this is the pre-
+Milestone-9 in-memory-only behavior) and once with `spill_threshold_bytes`
+forced down to ~5.2 MB, small enough to force many real spill rounds
+(`physical/operators.py`'s external-merge-sort for `order_by`, grace-hash
+spill/merge for `group_by`).
+
+```
+                       query |   no spill |   spilling |  slowdown
+------------------------------------------------------------------
+     order_by (2000000 rows) |    22.542s |    41.145s |     1.83x
+      group_by (500000 keys) |    17.777s |    56.113s |     3.16x
+```
+
+**Spilling was slower in both cases, as expected: 1.83x for sort, 3.16x
+for group-by.** This is the correct, honest tradeoff spilling makes, not
+a regression: without it, either query would grow its in-memory buffer
+(a sort buffer, a hash-aggregate table) without bound and eventually
+exhaust available memory on data large enough; spilling trades some of
+that speed for a bounded memory footprint, at the cost of real disk I/O
+(writing and reading pickled spill files) that a purely in-memory run
+never pays. The two workloads pay this cost differently:
+
+* **Sort's external-merge-sort** (1.83x) writes each accumulated buffer
+  as one already-sorted run per spill, then does one final
+  `heapq.merge()` pass across every run: the total amount of data
+  written and read is proportional to the row count once, regardless of
+  how many spill rounds that gets split into.
+* **Grace-hash aggregate spilling was proportionally more expensive**
+  (3.16x) because, per `_execute_hash_aggregate_partition`'s own
+  docstring, a spill clears the *entire* in-memory `groups` table, not
+  just the excess: a key spilled once and seen again later restarts from
+  `initialize()`, so the same key's state can be written to disk and
+  re-merged multiple times over the course of one partition, not written
+  once like a sort's rows are. This is the direct cost of the design
+  choice documented there (favoring bounded memory during the merge
+  phase too, one bucket at a time, over minimizing total spill I/O), not
+  an accident.
+
 ## Reproducing these numbers
 
 ```bash
 python -m benchmarks.scaling
 python -m benchmarks.csv_vs_parquet   # needs: pip install -e ".[columnar]"
 python -m benchmarks.join_strategy
+python -m benchmarks.skew
+python -m benchmarks.spilling
 ```
 
 Run from the repository root (not `python benchmarks/<name>.py`
