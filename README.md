@@ -1,222 +1,76 @@
 # MiniSpark
 
-A first-principles, single-machine distributed data-processing engine, built to
-understand, not to replace, systems like Apache Spark.
+A single-machine data processing engine built from scratch: a DataFrame API, SQL, a query planner and optimizer, a multi-process execution engine, disk-backed shuffle, Parquet support, fault tolerance, and memory-aware spilling. Built to understand how engines like Apache Spark work internally, not to replace one.
 
-MiniSpark is a research/educational project. It is not production-ready, not a
-Spark replacement, and no performance claim in this repository is made without
-an accompanying, actually-run benchmark (see `docs/benchmarks.md`; every
-number there was measured on a real machine, not invented, including results
-that do not flatter the design).
+[![CI](https://github.com/irhyl/minispark/actions/workflows/ci.yml/badge.svg)](https://github.com/irhyl/minispark/actions/workflows/ci.yml)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## Status
+## Overview
 
-Implemented so far:
+A query goes through the same stages a distributed engine uses: build a logical plan (or parse one from SQL), analyze it, optimize it, turn it into a physical plan, split it into stages at shuffle boundaries, and run it as tasks across worker processes. `local[N]` means N real OS processes (`concurrent.futures.ProcessPoolExecutor`), not threads and not a simulation.
 
-- **Data model** (`minispark/core/`): `DataType`, `Schema`, `Field`, `Record`,
-  `Partition`, `Dataset`. Partitions are lazy (row data is pulled on demand
-  via a factory function), so `partition -> operator -> partition` doesn't
-  require the whole dataset in memory.
-- **Expressions** (`minispark/expressions/`): a real expression tree
-  (`Column`, `Literal`, comparison/arithmetic/boolean operators, `IsNull` /
-  `IsNotNull` / `Not`, `Alias`) built via operator overloading, e.g.
-  `col("age") > 18`. Every expression exposes `children` for generic
-  tree-walking (used by the analyzer and the optimizer).
-- **Logical plan** (`minispark/logical/`): `Scan`, `Filter`, `Project`,
-  `Aggregate`, `Join`, `Sort`, plus an `explain()` pretty-printer.
-- **Analyzer** (`minispark/logical/analyzer.py`): validates every `Column`
-  reference against its child schema (including inside `group_by`/`agg`,
-  `join`, and `order_by`), rejects a `group_by`/`order_by` on anything but
-  a plain column, a non-aggregate expression in `agg()`, an unsupported
-  join type or missing/colliding join columns, and duplicate output
-  names, raising `AnalysisException` with a clear message instead of a
-  late `KeyError`.
-- **Query optimizer** (`minispark/optimizer/`): a rule-based optimizer
-  (constant folding, filter simplification, predicate pushdown -
-  including through a `Join`, projection pruning, redundant projection
-  elimination; every rule handles every logical node type) that runs to a
-  fixed point, plus `statistics.py` (exact, full-scan table/column
-  statistics, used directly by `Sort`'s physical planning, not yet by any
-  optimizer rule). These rules compute plan *shape* only (never touch
-  data); `physical/planner.py`'s scan-pushdown pass is what turns their
-  output into an actual, smaller read (see below).
-- **Physical plan** (`minispark/physical/`): translates an optimized
-  logical plan into physical operators. `Scan`/`Filter`/`Project`
-  translate 1:1; `Aggregate` becomes a partial (map-side) aggregate, a
-  shuffle exchange, and a final (reduce-side) aggregate; `Join` becomes a
-  `HashJoinExec` fed by either two shuffle exchanges (shuffle hash join,
-  the default) or one broadcast exchange (`broadcast=True`); `Sort`
-  becomes a local sort, a range-partitioned exchange, and a final sort.
-  Before any of that translation, a scan-pushdown pass re-reads a `Scan`
-  with real column/predicate hints wherever a Project/Filter chain and
-  the underlying source both allow it (real for Parquet: column pruning
-  and row-group-level predicate pushdown; real column pruning only for
-  CSV/Memory/Checkpoint), the second, deliberate exception (after
-  `Sort`'s range boundaries) to "building a plan never touches data."
-- **Shuffle** (`minispark/shuffle/`): `HashPartitioner` (stable across
-  processes, does not use Python's randomized builtin `hash()`, used by
-  `group_by`/`join`) and `RangePartitioner` (used by `order_by()`), a
-  disk-backed, checksummed block writer/reader (pickled records, not
-  JSON, to preserve exact types like an `Avg` aggregate's `(sum, count)`
-  partial state), and a driver-side `ShuffleManager` tracking which
-  blocks exist for which stage/partition, including broadcast reads.
-- **Storage** (`minispark/storage/`): an in-memory `DataSource`, a CSV
-  `DataSource` with schema inference and partitioned, streaming reads, a
-  checkpoint `DataSource` (reads back a `Dataset` durably materialized to
-  local disk by `DataFrame.checkpoint()`), and a Parquet `DataSource`
-  (real, pyarrow-backed columnar storage: genuine column pruning and
-  row-group-level predicate pushdown, partitioned at row-group
-  granularity, plus a writer producing one `.parquet` file per
-  partition). `pyarrow` is an optional extra (`pip install
-  minispark[columnar]`); nothing outside `storage/parquet.py` imports it,
-  and even that module's callers (`session.read.parquet()`, `df.write.
-  parquet()`) import it lazily, so using every other source never
-  requires it installed.
-- **Lazy DataFrame API** (`minispark/api/`): `filter()` / `select()` /
-  `group_by()` / `join()` / `order_by()` (alias `sort()`) build plan nodes
-  only; `collect()` / `show()` / `count()` / `explain()` are the only
-  things that trigger analysis, optimization, and execution.
-  `explain(optimized=True)` shows the analyzed, optimized, and physical
-  plans, plus every stage the query splits into. `checkpoint()` also
-  triggers execution (eagerly, like `collect()`), then returns a new
-  DataFrame whose plan is a fresh scan over the durably-materialized
-  result, cutting the original plan's lineage at that point. `write`
-  returns a `DataFrameWriter` (`df.write.parquet(path)`), also eager.
-  `last_run_metrics` exposes the most recently collected `QueryMetrics`
-  after an action runs (`None` before that): per-stage task counts,
-  wall-clock time, rows, bytes, shuffle bytes, retries, and, if `psutil`
-  is installed, CPU time and peak memory.
-- **SQL** (`minispark/sql/`): `session.sql("SELECT ...")` parses SQL text
-  (hand-written tokenizer + recursive-descent parser, no grammar
-  library) directly into the same logical plan nodes the DataFrame API
-  builds, no separate execution path. Supports one `SELECT` statement's
-  worth of grammar: `FROM` a registered temp view
-  (`session.create_or_replace_temp_view(name, df)`), one inner `JOIN
-  ... ON` (same-named column on both sides only, matching `Join`'s own
-  scope), `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, comparisons, boolean
-  connectives, arithmetic, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`. No
-  subqueries, `UNION`, window functions, `LIMIT`, CTEs, or UDFs: SQL is a
-  translator into existing capability, not a way to add new capability
-  without also extending the DataFrame API and logical plan.
-- **DAG, stages, and tasks** (`minispark/execution/dag.py`,
-  `stages.py`, `tasks.py`): classifies every physical node's dependency
-  as narrow or wide (a shuffle `Exchange` is the one wide node), splits a
-  physical plan into stages at wide-dependency boundaries (one stage for
-  a shuffle-free plan, two or more for `group_by`/`join`/`order_by`,
-  splitting each side of a `Join` independently), and represents one
-  partition's worth of work as a `Task` (whose `shuffle_blocks` is keyed
-  by source stage, since a join task reads from two upstream stages).
-- **Local scheduler** (`minispark/execution/scheduler.py`,
-  `worker.py`): `LocalScheduler` runs a plan's stages in order, turning
-  each into tasks that run either sequentially (`local[1]`) or across a
-  real `ProcessPoolExecutor` (`local[N>1]`, actual OS processes, not
-  threads), retries individual failed tasks up to
-  `engine.max_task_retries`, moves data between stages through a real
-  disk-backed shuffle (including broadcast reads), and merges the last
-  stage's results into a `Dataset`. `DataFrame` actions run through this
-  scheduler. When a task fails because a prior stage's shuffle blocks are
-  missing or corrupted (not an ordinary failure), the scheduler
-  recomputes that upstream stage from scratch and retries, lineage-based
-  recovery, rather than retrying a read that could never succeed on its
-  own; bounded to at most one recompute per stage per query.
-- **Naive executor** (`minispark/execution/executor.py`) and
-  `physical/operators.py`'s whole-Dataset `execute()`: earlier
-  milestones' execution paths, kept only as correctness oracles other
-  tests check the real path against.
-- **Spilling and memory-aware execution** (`minispark/physical/spill.py`,
-  `docs/spilling.md`): `SortExec` (external merge sort) and
-  `HashAggregateExec` (grace-hash partitioned spilling) both spill to
-  local disk once their in-memory buffer crosses `MemoryConfig.
-  spill_threshold_bytes`, instead of growing it without bound; both are
-  byte-for-byte identical to their prior behavior when the threshold is
-  never crossed (the default). `CSVDataSource` records a byte offset per
-  partition so each one seeks straight to its own row range instead of
-  re-parsing every row before it. `benchmarks/skew.py` and `benchmarks/
-  spilling.py` measure, respectively, data skew's effect on a reduce
-  stage and spilling's real wall-clock cost (see `docs/benchmarks.md`).
-- **Distributed readiness analysis** (`docs/distributed-readiness.md`):
-  a checked accounting of which parts of the design already would not
-  need to change if a worker became a separate machine (`Task`/
-  `TaskResult` picklability, the checksummed shuffle block format,
-  stage-granular lineage recovery) versus which parts are genuinely not
-  built yet (worker addressing, a fetch-over-network shuffle read path,
-  a safer wire format than trusted-same-machine pickle). No networking
-  or remote-worker code exists; `EngineConfig.master` still only accepts
-  `"local[N]"`.
+Everything above is implemented, not stubbed out, and tested against independently computed references rather than just checked for not crashing. There is no cluster, no cloud, and no GPU involved; this runs on one machine.
 
-The local phase described in the build spec's "Definition of done"
-section runs end to end: lazy plan, analyze, optimize, physical plan,
-DAG, stages, tasks, real multiprocess execution, shuffle, aggregation,
-retry of an injected task failure, metrics collection, a deterministic
-result, and a Parquet write, all verified together, not just as separate
-pieces. `order_by()` on the output of `group_by(...).agg(...)`, exactly
-the shape that example uses, is covered by a regression test
-(`tests/integration/test_group_by_e2e.py`'s `test_group_by_agg_then_
-order_by_matches_reference`) after fixing a real bug that combination
-used to trigger during physical planning.
+Not production-ready: no cost-based optimizer, no vectorized execution outside the Parquet read path, no dynamic resource allocation. Performance claims in this repo are backed by benchmarks that were actually run and reported as measured, including results that don't flatter the design (see [Benchmarks](#benchmarks)).
 
-Not implemented yet (by design, not oversight): left/right/full outer or
-semi/anti joins, differently-named join keys, sort-merge join,
-cost-based join strategy selection, and real network communication or
-cloud deployment (see `docs/distributed-readiness.md`). Every one of
-those has a numbered section in the build spec this project follows and
-lands in its own milestone (or, for the join-scope items, is an
-explicit, documented simplification of Milestone 5's own scope, see
-`logical/nodes.py`'s `Join` docstring). Within what Milestone 6 does
-cover: lineage-based recomputation is stage-granular (a lost partition is
-recovered by recomputing its entire upstream stage, not just the
-specific tasks that produced it) and capped at one recompute per stage
-per query; there is no automatic checkpoint directory lifetime
-management, `checkpoint()` never deletes an old checkpoint. Within what
-Milestone 7 does cover (see `docs/columnar-storage.md`): execution stays
-row-at-a-time everywhere except the Parquet read path itself, there is no
-vectorized Filter/Project; predicate pushdown only fires along a
-Filter-directly-on-Scan chain (never past a Project) and only covers
-comparisons/`And`/`Or`/`Not`/null-checks, no arithmetic; only
-bool/int/float/str/null round-trip through Parquet, no date/timestamp/
-decimal/nested types; row-group-to-partition assignment is contiguous
-chunking, not size-aware balancing; and `write.parquet()` has no
-target-file-size control or small-file coalescing. Within what
-Milestone 8 does cover (see `docs/sql.md` and `docs/benchmarks.md`): SQL
-has no subqueries/`UNION`/window functions/`LIMIT`/CTEs/UDFs, and a
-`JOIN ... ON` clause must compare a same-named column on both sides;
-`peak_memory_bytes` is a task's RSS at completion, not a continuously
-sampled true peak; and the benchmark scripts in `benchmarks/` are
-single-trial, uncontrolled measurements on one development machine, not
-a reproducible, isolated benchmark suite. For spilling and CSV
-byte-offset seeking (see `docs/spilling.md`): grace-hash aggregate
-spilling bounds memory but not time per bucket, so one hash bucket
-holding a
-disproportionate share of distinct keys (skew) is measured
-(`benchmarks/skew.py`) but not mitigated; a spill resets the whole
-in-memory table, not just the excess, which is why spilling measurably
-costs more for `group_by` than for `order_by` (`docs/benchmarks.md`);
-and CSV byte-offset seeking does not correctly handle a quoted field
-containing a literal embedded newline (misparses or raises
-`ValueError`, see `storage/csv.py`).
+## Architecture
 
-## Quick start
+```
+User API (DataFrame / SQL)
+        |
+Expression System            (Column, Literal, operators, Alias)
+        |
+Logical Plan                 (Scan, Filter, Project, Aggregate, Join, Sort)
+        |
+Analyzer                     (resolves columns, raises AnalysisException early)
+        |
+Query Optimizer               (predicate pushdown, projection pruning, constant folding, ...)
+        |
+Physical Plan                 (partial/final aggregates, hash/broadcast join, sort, scan pushdown)
+        |
+DAG Builder / Stage Planner   (splits at shuffle boundaries)
+        |
+Local Scheduler               (local[1] sequential, local[N>1] real ProcessPoolExecutor)
+        |
+Task Execution                (per-partition operators, spilling under memory pressure)
+        |
+Storage / Shuffle             (CSV, Parquet, checkpoints, checksummed shuffle blocks on disk)
+```
+
+The scheduler doesn't know SQL syntax, the parser doesn't know how tasks are executed, the optimizer never touches data, and the storage layer doesn't depend on the DataFrame API. Full package-by-package breakdown in `docs/architecture.md`.
+
+## Features
+
+- **Data model**: lazy partitions (a factory function, not materialized rows), so a query never has to hold a whole dataset in memory.
+- **Expressions**: a small expression tree built with operator overloading, e.g. `col("age") > 18`.
+- **Logical plan and analyzer**: `Scan`/`Filter`/`Project`/`Aggregate`/`Join`/`Sort`, with column validation that raises `AnalysisException` before execution starts instead of a late `KeyError`.
+- **Optimizer**: constant folding, filter simplification, predicate pushdown (including through a join), projection pruning, redundant projection elimination, run to a fixed point.
+- **Physical planning and shuffle**: an aggregate becomes partial aggregate + shuffle + final aggregate; a join becomes a shuffle hash join or a broadcast join; a sort becomes local sort + range partition + final sort. Shuffle blocks are checksummed files on local disk.
+- **Scheduler**: physical plans split into stages at shuffle boundaries, one task per partition per stage. `local[1]` runs sequentially; `local[N>1]` runs across a real process pool.
+- **Fault tolerance**: failed tasks retry individually; if an upstream stage's shuffle output goes missing or is corrupted, that whole stage recomputes and the query still finishes. Verified by a test that deletes a shuffle block file mid-query under real multiprocessing.
+- **Checkpointing**: `df.checkpoint()` materializes a DataFrame to disk and returns a new one whose lineage stops there.
+- **Parquet**: column pruning and row-group-level predicate pushdown that actually reduce what gets read, not just an optimizer pass with nothing behind it. Optional dependency (`pyarrow`); nothing else in the engine requires it.
+- **SQL**: a hand-written parser that compiles into the same logical plan the DataFrame API builds, so there's no separate execution path. Supports one `SELECT` statement's worth of grammar: `FROM`, one `JOIN ... ON`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, and five aggregate functions.
+- **Spilling**: sort and hash-aggregate execution both spill to local disk past a configurable memory threshold instead of growing without bound, with the same result whether or not spilling triggers.
+- **Metrics**: per-stage task counts, timing, rows, bytes, and retries after any action runs, plus CPU time and peak memory if `psutil` is installed.
+- **Distributed readiness**: a written analysis (`docs/distributed-readiness.md`) of what would and wouldn't need to change for workers to run on separate machines. No networking code exists; `local[N]` is still the only supported mode.
+
+## Install
 
 ```bash
 pip install -e ".[dev]"
-pytest
-python examples/basic_dataframe.py
-python examples/aggregations.py
-python examples/joins.py
-python examples/checkpointing.py
-python examples/sql.py
 
-# Parquet support needs the optional columnar extra:
+# Parquet support:
 pip install -e ".[columnar]"
-python examples/parquet.py
 
-# Benchmarks (see docs/benchmarks.md for recorded numbers and caveats):
-python -m benchmarks.scaling
-python -m benchmarks.join_strategy
-python -m benchmarks.csv_vs_parquet   # needs the columnar extra above
-python -m benchmarks.skew
-python -m benchmarks.spilling
+# CPU/memory metrics:
+pip install -e ".[monitoring]"
 ```
+
+Requires Python 3.12+. The core engine has no third-party runtime dependencies; `pyarrow`, `psutil`, `pandas`, and `duckdb` are optional extras, only needed for the specific feature that uses them.
+
+## Quickstart
 
 ```python
 from minispark.api.session import MiniSparkSession
@@ -231,36 +85,75 @@ result = (
     .group_by("country")
     .agg(count("*").alias("adults"), avg("age").alias("avg_age"))
 )
-result.explain(optimized=True)
+result.explain(optimized=True)  # analyzed -> optimized -> physical plan -> stages
 result.show()
 ```
 
-## Architecture
+Same query in SQL, compiling into the identical plan:
 
-See `docs/architecture.md` for the layered design and why each layer
-exists, `docs/query-planning.md` for how a DataFrame call (or a SQL
-query, see below) gets from a logical plan to a physical plan (analyzer,
-optimizer, physical plan, including the scan-pushdown pass),
-`docs/execution-model.md` for how that physical plan actually runs (DAG,
-stages, tasks, the local scheduler, what `local[N]` really does,
-lineage-based recomputation and checkpointing, and how query metrics are
-collected), `docs/shuffle.md` for exactly what happens at a shuffle
-boundary (partial aggregation, hash partitioning, the on-disk block
-format shared by shuffle blocks and checkpoints), `docs/columnar-storage.md`
-for Parquet reading/writing, real column pruning, and real predicate
-pushdown, `docs/sql.md` for exactly what SQL is and is not supported and
-why, `docs/spilling.md` for how `order_by`/`group_by` spill to local
-disk under memory pressure and the CSV byte-offset read optimization,
-`docs/distributed-readiness.md` for what would and would not need to
-change for workers to run on separate machines, and `docs/benchmarks.md`
-for real, actually-measured numbers (and their caveats) on `local[N]`
-scaling, CSV vs. Parquet, broadcast vs. shuffle joins, data skew, and
-spilling.
+```python
+session.create_or_replace_temp_view("users", df)
+session.sql("""
+    SELECT country, COUNT(*) AS adults, AVG(age) AS avg_age
+    FROM users
+    WHERE age >= 18
+    GROUP BY country
+""").show()
+```
 
-## Development
+More examples in `examples/`: `basic_dataframe.py`, `aggregations.py`, `joins.py`, `checkpointing.py`, `sql.py`, `parquet.py`.
+
+## Testing
 
 ```bash
-make test     # pytest
-make lint     # ruff check
-make format   # ruff format
+make test        # pytest: unit + integration, including real multiprocessing
+make lint         # ruff check
+make format       # ruff format
+make typecheck    # mypy minispark
 ```
+
+Operators are tested against independently computed references (a manual calculation or plain Python), not just against MiniSpark's own output, covering nulls, empty datasets, duplicates, and skewed keys. Fault tolerance and real multiprocessing have dedicated integration tests rather than mocks: `tests/integration/test_scheduler_multiprocessing.py`, `test_lineage_recovery_e2e.py`.
+
+## Benchmarks
+
+Numbers in `docs/benchmarks.md` come from actually running the scripts in `benchmarks/` on one development machine, single trial, uncontrolled.
+
+```bash
+python -m benchmarks.scaling          # local[1] vs local[N] on a shuffle-heavy query
+python -m benchmarks.join_strategy    # broadcast join vs shuffle hash join
+python -m benchmarks.csv_vs_parquet   # column pruning + predicate pushdown (needs [columnar])
+python -m benchmarks.skew             # data skew's effect on a reduce stage
+python -m benchmarks.spilling         # the wall-clock cost of spilling to disk
+```
+
+| Comparison | Result |
+|---|---|
+| Parquet vs. CSV (filtered, narrow projection) | Parquet ~4.4x faster |
+| Broadcast join vs. shuffle hash join | Broadcast ~1.9x faster |
+| `local[1]` vs. `local[16]` (small/medium data) | `local[1]` was faster, reported as measured |
+| Spilling vs. staying in memory | 1.8x-3.2x slower, the cost of bounding memory |
+
+## Documentation
+
+| Doc | Covers |
+|---|---|
+| `docs/build-spec.md` | The governing spec: objective, layering, technology constraints, milestones |
+| `docs/architecture.md` | Package-by-package layering and the reasoning behind each design choice |
+| `docs/query-planning.md` | Logical plan, analyzer, optimizer, physical plan |
+| `docs/execution-model.md` | DAG, stages, tasks, the local scheduler, lineage recovery, checkpointing, metrics |
+| `docs/shuffle.md` | Partitioning, the on-disk block format, joins, sort |
+| `docs/columnar-storage.md` | Parquet reading/writing, column pruning, predicate pushdown |
+| `docs/sql.md` | What SQL is and isn't supported, and why |
+| `docs/spilling.md` | External merge sort, grace-hash aggregate spilling, CSV byte-offset seeking |
+| `docs/distributed-readiness.md` | What would and wouldn't need to change for multi-machine execution |
+| `docs/benchmarks.md` | Every benchmark number and its caveats |
+
+## Status
+
+All ten milestones in `docs/build-spec.md` are implemented, including the final one, which the spec itself scopes as an architecture-readiness analysis rather than an implementation.
+
+Not implemented, by design: left/right/full outer or semi/anti joins, differently-named join keys, sort-merge join, cost-based join strategy selection, and any real network communication or cloud deployment. Reasoning for each is in `docs/architecture.md`'s "What's deliberately not here yet."
+
+## License
+
+MIT. See [LICENSE](LICENSE).
