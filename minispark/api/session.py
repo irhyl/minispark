@@ -14,7 +14,7 @@ from minispark.config.log import configure_logging, get_logger
 from minispark.core.record import Record
 from minispark.core.schema import Schema
 from minispark.logical.nodes import Scan
-from minispark.storage.csv import read_csv
+from minispark.storage.csv import CSVDataSource
 from minispark.storage.memory import MemoryDataSource
 
 logger = get_logger("session")
@@ -25,8 +25,27 @@ class DataFrameReader:
         self._session = session
 
     def csv(self, path: str, schema: Schema | None = None, num_partitions: int = 4) -> DataFrame:
-        dataset = read_csv(path, schema=schema, num_partitions=num_partitions)
-        return DataFrame(self._session, Scan(dataset, source_name=f"csv:{path}"))
+        source = CSVDataSource(path, schema=schema, num_partitions=num_partitions)
+        dataset = source.read()
+        return DataFrame(self._session, Scan(dataset, source_name=f"csv:{path}", source=source))
+
+    def parquet(self, path: str, num_partitions: int = 4) -> DataFrame:
+        """Read a Parquet file or directory of Parquet files.
+
+        Local import: `pyarrow` is an optional extra (`pip install
+        minispark[columnar]`), and nothing outside storage/parquet.py may
+        import it unconditionally, or merely importing
+        `minispark.api.session` (to call `.csv()`, say) would require
+        pyarrow to be installed even when it is never used. See
+        storage/parquet.py's module docstring.
+        """
+        from minispark.storage.parquet import ParquetDataSource
+
+        source = ParquetDataSource(path, num_partitions=num_partitions)
+        dataset = source.read()
+        return DataFrame(
+            self._session, Scan(dataset, source_name=f"parquet:{path}", source=source)
+        )
 
 
 class MiniSparkSessionBuilder:
@@ -72,5 +91,6 @@ class MiniSparkSession:
     def create_dataframe(
         self, records: list[Record], schema: Schema | None = None, num_partitions: int = 4
     ) -> DataFrame:
-        dataset = MemoryDataSource(records, schema=schema, num_partitions=num_partitions).read()
-        return DataFrame(self, Scan(dataset, source_name="memory"))
+        source = MemoryDataSource(records, schema=schema, num_partitions=num_partitions)
+        dataset = source.read()
+        return DataFrame(self, Scan(dataset, source_name="memory", source=source))
