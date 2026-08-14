@@ -231,6 +231,27 @@ def _plan_sort(sort: Sort, shuffle_partitions: int, spill_threshold_bytes: int) 
     )
 
 
+def _is_oracle_executable(plan: PhysicalPlan) -> bool:
+    """True if `plan` is entirely Scan/Filter/Project, the only node
+    types `physical/operators.py`'s whole-Dataset `execute()` oracle
+    knows how to run. `_sort_range_boundaries()` (below) needs this
+    checked *before* calling `execute()` eagerly: a child chain
+    containing an `Aggregate`/`Join` (and therefore, physically, an
+    `ExchangeExec`) has no whole-Dataset in-memory equivalent at
+    planning time, a real shuffle has not happened yet, so `execute()`
+    cannot run it at all, not just "less efficiently." Found by actually
+    running `group_by(...).agg(...).order_by(...)`, the exact shape in
+    the build spec's own "Definition of done" example: an earlier
+    version of `_sort_range_boundaries` called `execute()` unconditionally
+    and only fell back to a single shuffle partition for a non-numeric
+    key or `shuffle_partitions <= 1`, so this combination raised
+    `NotImplementedError` instead of falling back the same way.
+    """
+    if not isinstance(plan, (ScanExec, FilterExec, ProjectExec)):
+        return False
+    return all(_is_oracle_executable(child) for child in plan.children)
+
+
 def _sort_range_boundaries(
     child_physical: PhysicalPlan,
     primary_key: Column,
@@ -250,9 +271,10 @@ def _sort_range_boundaries(
     buckets is to look at the data before the shuffle that needs those
     cut points runs. `child_physical` must therefore be something
     `physical/operators.py`'s whole-Dataset `execute()` can run directly
-    (Scan/Filter/Project): sorting the output of a Join or an Aggregate
-    is not supported, `execute()` cannot run those, they need a real
-    shuffle to mean anything, which does not exist yet at planning time.
+    (Scan/Filter/Project, checked by `_is_oracle_executable` above):
+    sorting the output of a Join or an Aggregate falls back to a single
+    shuffle partition instead (see below), the same as any other case
+    where a real multi-bucket range split is not available.
 
     Also returns the expression the shuffle should actually partition on
     (`partition_key`): `RangePartitioner` (shuffle/partitioner.py) always
@@ -273,20 +295,25 @@ def _sort_range_boundaries(
     meaning a plain, boundary-less exchange, equivalent to
     `HashPartitioner(1)` where every row lands in the one and only target
     partition anyway) whenever a real multi-bucket range split is not
-    meaningful: `shuffle_partitions <= 1`, the sort key's type is not
-    numeric (equal-*width* bucketing of, say, a string's range is not
-    implemented), or the observed data has no non-null values to compute
-    a range from. A single partition is always correct, just not
-    parallel: there is only one target, so no row needs to land in a
-    specific range relative to any other partition's rows for the final
-    per-partition sort (and single-partition read order) to be globally
-    sorted.
+    meaningful or not possible: `shuffle_partitions <= 1`, the sort key's
+    type is not numeric (equal-*width* bucketing of, say, a string's
+    range is not implemented), `child_physical` is not something
+    `execute()` can run (sorting the output of a Join or an Aggregate),
+    or the observed data has no non-null values to compute a range from.
+    A single partition is always correct, just not parallel: there is
+    only one target, so no row needs to land in a specific range
+    relative to any other partition's rows for the final per-partition
+    sort (and single-partition read order) to be globally sorted.
     """
     key_name = primary_key.name
     key_type = (
         child_schema.get_field(key_name).data_type if child_schema.has_field(key_name) else None
     )
-    if shuffle_partitions <= 1 or key_type not in (INT, FLOAT):
+    if (
+        shuffle_partitions <= 1
+        or key_type not in (INT, FLOAT)
+        or not _is_oracle_executable(child_physical)
+    ):
         return None, 1, primary_key
 
     dataset = execute_whole_dataset(child_physical)
