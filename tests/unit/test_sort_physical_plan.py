@@ -1,9 +1,13 @@
+import os
+import random
+
 from minispark.api.functions import col
 from minispark.core.dataset import Dataset
 from minispark.core.partition import Partition, PartitionMetadata
 from minispark.core.schema import Field, Schema
 from minispark.core.types import INT, STRING
 from minispark.logical.nodes import Scan, Sort
+from minispark.physical import operators as operators_module
 from minispark.physical.operators import execute_partition
 from minispark.physical.plan import ExchangeExec, ScanExec, SortExec
 from minispark.physical.planner import plan_physical
@@ -113,3 +117,57 @@ def test_local_sort_execution_multi_key_mixed_direction():
         {"age": 30, "name": "b"},
         {"age": 30, "name": "a"},
     ]
+
+
+def test_spilling_produces_same_result_as_non_spilling_on_random_data():
+    """Regression test for a real bug: an earlier version of the spilling
+    merge (`heapq.merge()` over spilled runs) reordered fully-tied rows
+    relative to a single non-spilling stable sort, because ties were
+    broken by spill-chunk position instead of original arrival order. A
+    tiny `spill_threshold_bytes` here forces many spill rounds on 500
+    rows with a small, collision-prone key space (`k` in 0..5, `k2`
+    including None), which is what actually caught the bug during
+    development."""
+    schema = Schema([Field("k", INT), Field("v", STRING), Field("k2", INT)])
+    random.seed(42)
+    rows = [
+        {"k": random.randint(0, 5), "v": f"row-{i}", "k2": random.choice([None, 0, 1])}
+        for i in range(500)
+    ]
+    partition = Partition(0, schema, lambda: iter(rows), PartitionMetadata())
+    scan_exec = ScanExec(Dataset(schema, [partition]), "test")
+
+    no_spill = SortExec(
+        scan_exec, [col("k"), col("k2")], [True, False], schema, spill_threshold_bytes=2**62
+    )
+    spilling = SortExec(
+        scan_exec, [col("k"), col("k2")], [True, False], schema, spill_threshold_bytes=200
+    )
+
+    no_spill_rows = execute_partition(no_spill, 0).to_list()
+    spilled_rows = execute_partition(spilling, 0).to_list()
+    assert len(no_spill_rows) == len(rows)
+    assert spilled_rows == no_spill_rows
+
+
+def test_spilling_cleans_up_its_temp_directory_after_full_consumption(monkeypatch, tmp_path):
+    schema = Schema([Field("age", INT)])
+    rows = [{"age": i} for i in range(50)]
+    partition = Partition(0, schema, lambda: iter(rows), PartitionMetadata())
+    scan_exec = ScanExec(Dataset(schema, [partition]), "test")
+    sort_exec = SortExec(scan_exec, [col("age")], [True], schema, spill_threshold_bytes=100)
+
+    captured: dict[str, str] = {}
+    real_make_spill_dir = operators_module.make_spill_dir
+
+    def spy_make_spill_dir(prefix: str) -> str:
+        directory = real_make_spill_dir(prefix)
+        captured["dir"] = directory
+        return directory
+
+    monkeypatch.setattr(operators_module, "make_spill_dir", spy_make_spill_dir)
+
+    result = execute_partition(sort_exec, 0).to_list()
+    assert result == sorted(rows, key=lambda r: r["age"])
+    assert "dir" in captured
+    assert not os.path.exists(captured["dir"])
