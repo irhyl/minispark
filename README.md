@@ -128,23 +128,41 @@ Implemented so far:
   `HashAggregateExec` (grace-hash partitioned spilling) both spill to
   local disk once their in-memory buffer crosses `MemoryConfig.
   spill_threshold_bytes`, instead of growing it without bound; both are
-  byte-for-byte identical to their pre-Milestone-9 behavior when the
-  threshold is never crossed (the default). `CSVDataSource` now records
-  a byte offset per partition so each one seeks straight to its own row
-  range instead of re-parsing every row before it. `benchmarks/skew.py`
-  and `benchmarks/spilling.py` measure, respectively, data skew's effect
-  on a reduce stage and spilling's real wall-clock cost (see
-  `docs/benchmarks.md`).
+  byte-for-byte identical to their prior behavior when the threshold is
+  never crossed (the default). `CSVDataSource` records a byte offset per
+  partition so each one seeks straight to its own row range instead of
+  re-parsing every row before it. `benchmarks/skew.py` and `benchmarks/
+  spilling.py` measure, respectively, data skew's effect on a reduce
+  stage and spilling's real wall-clock cost (see `docs/benchmarks.md`).
+- **Distributed readiness analysis** (`docs/distributed-readiness.md`):
+  a checked accounting of which parts of the design already would not
+  need to change if a worker became a separate machine (`Task`/
+  `TaskResult` picklability, the checksummed shuffle block format,
+  stage-granular lineage recovery) versus which parts are genuinely not
+  built yet (worker addressing, a fetch-over-network shuffle read path,
+  a safer wire format than trusted-same-machine pickle). No networking
+  or remote-worker code exists; `EngineConfig.master` still only accepts
+  `"local[N]"`.
+
+The local phase described in the build spec's "Definition of done"
+section runs end to end: lazy plan, analyze, optimize, physical plan,
+DAG, stages, tasks, real multiprocess execution, shuffle, aggregation,
+retry of an injected task failure, metrics collection, a deterministic
+result, and a Parquet write, all verified together, not just as separate
+pieces. `order_by()` on the output of `group_by(...).agg(...)`, exactly
+the shape that example uses, is covered by a regression test
+(`tests/integration/test_group_by_e2e.py`'s `test_group_by_agg_then_
+order_by_matches_reference`) after fixing a real bug that combination
+used to trigger during physical planning.
 
 Not implemented yet (by design, not oversight): left/right/full outer or
 semi/anti joins, differently-named join keys, sort-merge join,
-cost-based join strategy selection, and remote-worker architecture
-readiness (real network communication and cloud deployment). Every one
-of those has a numbered section in the build spec this project follows
-and lands in its own milestone (or,
-for the join-scope items, is an explicit, documented simplification of
-Milestone 5's own scope, see `logical/nodes.py`'s `Join` docstring).
-Within what Milestone 6 does
+cost-based join strategy selection, and real network communication or
+cloud deployment (see `docs/distributed-readiness.md`). Every one of
+those has a numbered section in the build spec this project follows and
+lands in its own milestone (or, for the join-scope items, is an
+explicit, documented simplification of Milestone 5's own scope, see
+`logical/nodes.py`'s `Join` docstring). Within what Milestone 6 does
 cover: lineage-based recomputation is stage-granular (a lost partition is
 recovered by recomputing its entire upstream stage, not just the
 specific tasks that produced it) and capped at one recompute per stage
@@ -233,9 +251,11 @@ for Parquet reading/writing, real column pruning, and real predicate
 pushdown, `docs/sql.md` for exactly what SQL is and is not supported and
 why, `docs/spilling.md` for how `order_by`/`group_by` spill to local
 disk under memory pressure and the CSV byte-offset read optimization,
-and `docs/benchmarks.md` for real, actually-measured numbers (and their
-caveats) on `local[N]` scaling, CSV vs. Parquet, broadcast vs. shuffle
-joins, data skew, and spilling.
+`docs/distributed-readiness.md` for what would and would not need to
+change for workers to run on separate machines, and `docs/benchmarks.md`
+for real, actually-measured numbers (and their caveats) on `local[N]`
+scaling, CSV vs. Parquet, broadcast vs. shuffle joins, data skew, and
+spilling.
 
 ## Development
 
