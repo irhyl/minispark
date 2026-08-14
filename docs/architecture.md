@@ -33,8 +33,11 @@ Task Execution
 Storage / Shuffle
 ```
 
-**Milestone 7 status**: every layer above is implemented. `DataFrame`
-actions (`collect`/`show`/`count`/`explain`) run, in order:
+**Milestone 8 status**: every layer above is implemented. A `DataFrame`
+is built either by chaining API calls or by `session.sql(...)` parsing
+SQL text into the identical logical plan (`sql/parser.py`, see
+`docs/sql.md`); from that point on the two are indistinguishable.
+`DataFrame` actions (`collect`/`show`/`count`/`explain`) run, in order:
 `logical/analyzer.py` (validates the plan), `optimizer/optimizer.py`
 (rewrites it), `physical/planner.py` (translates it to a physical plan,
 including turning `group_by(...).agg(...)` into a partial aggregate, a
@@ -50,9 +53,12 @@ stage for a shuffle-free plan, two or more for a plan with `group_by`/
 scheduler.py`'s `LocalScheduler` (runs each stage's `Task`s, either
 sequentially or across a real `ProcessPoolExecutor` depending on
 `local[N]`, moving data between stages through a real disk-backed
-shuffle, see `docs/shuffle.md`). See `docs/execution-model.md` for the
-full DAG/Stage/Task/Worker/Scheduler picture; this file stays focused on
-package layout and design decisions.
+shuffle, see `docs/shuffle.md`, and building a `QueryMetrics` summary
+along the way, see Key Milestone-8 design decisions below and
+`docs/execution-model.md`'s "Metrics and profiling"). See
+`docs/execution-model.md` for the full DAG/Stage/Task/Worker/Scheduler
+picture; this file stays focused on package layout and design
+decisions.
 
 `minispark/execution/executor.py` (Milestone 1's naive, single-process,
 logical-plan interpreter) and `physical/operators.py`'s whole-Dataset
@@ -171,10 +177,25 @@ equivalent unoptimized plan.
 
 - **`minispark/execution/`**: `executor.py` (Milestone 1's naive
   logical-plan interpreter, kept only as a correctness oracle), `dag.py`,
-  `stages.py`, `tasks.py`, `worker.py`, `scheduler.py`. See
+  `stages.py`, `tasks.py`, `worker.py`, `scheduler.py`, and, as of
+  Milestone 8, `metrics.py` (`StageMetrics`/`QueryMetrics`, aggregated
+  from `TaskMetrics` across a whole `run_plan()` call). See
   `docs/execution-model.md` for what each of these does and how they fit
   together; that document, not this one, is the place to look for the
   full DAG/Stage/Task/Worker/Scheduler picture.
+
+- **`minispark/sql/`** (Milestone 8, a SQL front-end, not a second
+  execution engine). `tokenizer.py` (hand-written lexer) and `parser.py`
+  (`parse_sql()`, a hand-written recursive-descent parser with
+  precedence climbing for expressions) translate SQL text directly into
+  the same `logical/nodes.py` nodes and `expressions/` trees the
+  DataFrame API builds. Depends on `logical/` and `expressions/` only,
+  never on `api/`: `api/session.py`'s `MiniSparkSession.sql()` is what
+  resolves table names (against its own `_temp_views` registry) and
+  wraps the resulting `LogicalPlan` back into a `DataFrame`, keeping
+  `parse_sql()` itself testable with a plain `dict[str, LogicalPlan]`,
+  no session required. See `docs/sql.md` for the supported grammar and
+  every scope decision behind it.
 
 - **`minispark/api/`** — `DataFrame` (lazy; `filter`/`select`/`group_by`/
   `join`/`order_by` (alias `sort`) build plan nodes, `collect`/`show`/
@@ -184,12 +205,16 @@ equivalent unoptimized plan.
   is a fresh `Scan` over the durably-materialized result, see Key
   Milestone-6 design decisions below; `write` (Milestone 7) returns a
   `DataFrameWriter`, `df.write.parquet(path)`, also eager, writing one
-  `.parquet` file per partition, see `docs/columnar-storage.md`),
-  `grouped.py` (`GroupedData`, the result of `group_by()` before
-  `.agg()` turns it back into a `DataFrame`), `writer.py`
-  (`DataFrameWriter`, the write-side mirror of `session.py`'s
-  `DataFrameReader`), `MiniSparkSession` (+ builder), `functions.py`
-  (`col()`, `lit()`, `count()`, `sum()`, `avg()`, `min()`, `max()`).
+  `.parquet` file per partition, see `docs/columnar-storage.md`;
+  `last_run_metrics`, Milestone 8, exposes the most recently collected
+  `QueryMetrics`, `None` until an action has run, see Key Milestone-8
+  design decisions below), `grouped.py` (`GroupedData`, the result of
+  `group_by()` before `.agg()` turns it back into a `DataFrame`),
+  `writer.py` (`DataFrameWriter`, the write-side mirror of `session.py`'s
+  `DataFrameReader`), `MiniSparkSession` (+ builder; `sql()` and
+  `create_or_replace_temp_view()`, Milestone 8, are the SQL entry point,
+  see `minispark/sql/` above), `functions.py` (`col()`, `lit()`,
+  `count()`, `sum()`, `avg()`, `min()`, `max()`).
   `DataFrameReader.parquet()`/`DataFrameWriter.parquet()` both import
   `storage/parquet.py` *inside* the method body, not at module top,
   since `pyarrow` is an optional extra and `import minispark.api.
@@ -203,7 +228,9 @@ equivalent unoptimized plan.
   Logical Plan" (post-`Optimizer.optimize()`), "Physical Plan" (post-
   `plan_physical()`), and "Stages" (post-`build_stages()`, one section
   per stage, however many that turns out to be), so a user can see what
-  each step changed.
+  each step changed. `explain()` never executes anything, before or
+  after Milestone 8; `last_run_metrics` is the separate mechanism for
+  what a query actually did, not what it would do.
 
 - **`minispark/config/`** — `Config`/`EngineConfig`/`ExecutionConfig`/
   `MemoryConfig`/`OptimizerConfig` dataclasses matching the shape in the
@@ -219,6 +246,109 @@ equivalent unoptimized plan.
   `docs/shuffle.md`'s Sort section for when it falls back to one
   partition instead). `execution.partition_size_mb`, `execution.
   shuffle_compression`, and `memory` are still unread.
+
+## Key Milestone-8 design decisions
+
+**SQL is a translator into the existing logical plan, never a second
+interpreter.** The build spec is explicit: "there must not be a
+separate SQL execution engine." `sql/parser.py`'s `parse_sql()` builds
+`logical/nodes.py` nodes directly, the same `Scan`/`Filter`/`Project`/
+`Aggregate`/`Join`/`Sort` the DataFrame API builds; `MiniSparkSession.
+sql()` hands the result to a plain `DataFrame`, which runs through the
+exact same analyze/optimize/physical-plan/stage/schedule path any other
+`DataFrame` does. Checked directly, not just asserted: `tests/
+integration/test_sql_e2e.py` compares `explain_string()` output between
+a SQL-built and an API-built `DataFrame` for the equivalent query and
+requires them to be textually identical, both before and after the
+scan-pushdown pass, not merely "produces the same rows."
+
+**A hand-written tokenizer and recursive-descent parser, not a grammar
+library.** The build spec's allowed-dependencies line permits "a
+lightweight parser if needed for SQL." The supported grammar (`sql/
+parser.py`'s module docstring: `SELECT`/`FROM`/one `JOIN`/`WHERE`/
+`GROUP BY`/`HAVING`/`ORDER BY`, comparisons, boolean connectives,
+arithmetic, five aggregate functions) is small and fixed enough that a
+generated parser or a third-party grammar would be more machinery than
+the problem needs, the same reasoning `optimizer/rules.py` gives for not
+having a generic tree-visitor abstraction over six logical node types.
+
+**SQL support is scoped to mirror the DataFrame API exactly, not to
+add capability.** `Join`'s `on=` only supports a column with the same
+name on both sides (see `logical/nodes.py`'s `Join` docstring); SQL's
+`JOIN ... ON a = b` enforces the same restriction at parse time
+(`SqlParseError`, not a confusing failure three layers downstream) via a
+plain string-equality check on the two column names, once the query's
+own qualifiers (`table.column`) have been stripped, matching-name
+required. Grouping/aggregation similarly only supports what `Aggregate`
+already supports: no `LIMIT`, no window functions, no subqueries, no
+`UNION`. Adding SQL syntax for any of these without first adding the
+underlying `LogicalPlan`/execution support would be exactly the
+"separate execution engine" the build spec forbids, just spelled as new
+grammar instead of a new interpreter.
+
+**`HAVING`'s aggregate function calls resolve to `Column` references by
+structural match, not by re-embedding the raw aggregate expression.** A
+first version of `HAVING COUNT(*) >= 1` built `GreaterEqual(Count(None),
+Literal(1))` directly, the literal parse of the clause, and it crashed:
+`AggregateFunction.evaluate()` (expressions/aggregate.py) raises
+`NotImplementedError` on purpose (an aggregate has no per-row value
+until `HashAggregateExec` finalizes it), and `HAVING` runs as a plain
+row-level `Filter` *after* the `Aggregate`, where the row already holds
+the finalized value under its output alias, not the raw
+`AggregateFunction` object. Caught immediately by actually running the
+query, not just by unit-testing the parser's output shape. The fix,
+`_substitute_aggregates_with_output_columns()`, rebuilds the `HAVING`
+expression tree, replacing any `AggregateFunction` node with a `Column`
+reference to the matching `SELECT`-list aggregate's output name,
+matched by `repr()` equality (`Expression.__eq__` is overloaded to
+build an `Equal` node, not compare for equality, the same reason
+`Optimizer.optimize()`'s fixed-point check compares `explain_string()`
+text instead of `==`). An aggregate referenced in `HAVING` but absent
+from `SELECT` raises `SqlParseError` rather than silently adding a
+second, hidden aggregate the way some SQL engines allow.
+
+**Metrics are a plain scheduler attribute, not a change to `run_plan()`'s
+return type.** `LocalScheduler.run_plan()` has returned a `Dataset` and
+nothing else since Milestone 3; every caller depends on that. Rather
+than widen it to a tuple (and touch every call site), `run_plan()` now
+also sets `self.last_metrics: QueryMetrics`, read immediately afterward
+by `api/dataframe.py`'s `DataFrame._collect_dataset()` and exposed as
+`DataFrame.last_run_metrics`. Deliberately not threaded into `explain()`:
+`explain()` has never executed anything, and folding "what happened"
+into "what would happen" would change an already-stable, widely used
+method's contract. A lineage-recomputed stage gets its own, second
+`StageMetrics` entry (`recomputed=True`), not merged into the first:
+both runs did real, separately measurable work, and merging them would
+understate what a fault actually cost.
+
+**Profiling reuses the pyarrow-style optional-dependency pattern, with
+one necessary difference.** `psutil` (`cpu_time_seconds`/
+`peak_memory_bytes` on `TaskMetrics`, filled in by `execution/
+worker.py`) is optional like `pyarrow`, but the import cannot be
+deferred to inside a method the way `storage/parquet.py`'s callers defer
+theirs: `execute_task` runs unconditionally for *every* task, Parquet or
+not, so there is no feature-specific method boundary to hide the import
+behind. Instead, `worker.py` attempts `import psutil` once at module
+load time inside a `try`/`except ImportError`, leaving the module-level
+name `None` on failure, with every use guarded by `if _psutil is not
+None`; both fields simply stay `None`, exactly their pre-Milestone-8
+state, when `psutil` is not installed. `peak_memory_bytes` is
+documented as this process's RSS at task completion, not a true,
+continuously sampled peak (which would need a background thread polling
+concurrently with the task, not implemented), rather than silently
+overstating precision the measurement does not have.
+
+**Benchmarks report what was actually measured, including results that
+do not flatter the design.** `benchmarks/scaling.py`'s `local[1]` vs
+`local[N]` comparison found `local[1]` faster at every tested size on
+this development machine (`docs/benchmarks.md`), the opposite of what a
+"more workers is faster" story would predict. Reported anyway, with the
+`ProcessPoolExecutor`-on-Windows (`spawn`, not `fork`) and per-task
+disk-backed-shuffle overhead named as the most likely explanation,
+because the build spec's non-negotiables include "never claim
+scalability without measurements," and a measurement that contradicts
+the design's intent is still a measurement, not a bug to be quietly
+tuned away in the writeup.
 
 ## Key Milestone-7 design decisions
 
@@ -707,10 +837,11 @@ used as dict/set keys for value equality.
 
 ## What's deliberately not here yet
 
-Per the build spec's milestone breakdown: SQL and benchmarking. Each has
-a numbered section in the build spec and lands in the milestone assigned
-to it, see `README.md`'s status section for the current cut line. Within
-what Milestone 5 does cover: `Join` only supports `how="inner"` with
+Per the build spec's milestone breakdown: performance optimization/
+skew/spilling (Milestone 9) and remote-worker architecture readiness
+(Milestone 10). Each has a numbered section in the build spec and lands
+in the milestone assigned to it, see `README.md`'s status section for
+the current cut line. Within what Milestone 5 does cover: `Join` only supports `how="inner"` with
 common-named `on=` columns (no left/right/full outer, no semi/anti, no
 differently-named join keys); there is no sort-merge join, only hash
 join (broadcast or shuffled); broadcast-vs-shuffle join selection is an
@@ -742,7 +873,20 @@ partition assignment is contiguous chunking, not size- or row-count-
 aware balancing, so a Parquet file with very unevenly sized row groups
 can still produce skewed partitions; and `write.parquet()` always writes
 one file per partition with no target-file-size control or coalescing.
-Nothing spills an in-progress aggregate's hash table or sort buffer to
-disk under memory pressure (Milestone 9), and shuffle output is never
-compressed (`ExecutionConfig.shuffle_compression` exists but is
-unread).
+Within what Milestone 8 does cover (see Key Milestone-8 design
+decisions, above, `docs/sql.md`, and `docs/execution-model.md`'s
+"Metrics and profiling"): SQL supports one `SELECT` statement's worth of
+grammar (`FROM`/one inner `JOIN`/`WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`,
+comparisons, boolean connectives, arithmetic, five aggregate functions),
+no subqueries, `UNION`, window functions, `LIMIT`, CTEs, or UDFs, and a
+`JOIN ... ON` clause must compare a same-named column on both sides,
+exactly `Join`'s own restriction; `peak_memory_bytes` is a task's RSS at
+completion, not a continuously sampled true peak; `QueryMetrics` is
+never available before an action runs (by design, see "Metrics are a
+plain scheduler attribute" above); and the benchmark scripts in
+`benchmarks/` are single-trial, uncontrolled measurements on one
+development machine, not a reproducible, isolated benchmark suite (see
+`docs/benchmarks.md`'s own stated caveat). Nothing spills an in-progress
+aggregate's hash table or sort buffer to disk under memory pressure
+(Milestone 9), and shuffle output is never compressed
+(`ExecutionConfig.shuffle_compression` exists but is unread).
