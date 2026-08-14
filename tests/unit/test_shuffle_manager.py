@@ -36,7 +36,10 @@ def test_blocks_for_returns_only_the_requested_partition():
     mgr.cleanup()
 
 
-def test_register_blocks_accumulates_across_multiple_source_tasks():
+def test_register_blocks_covers_every_source_task_in_one_call():
+    """execution/scheduler.py always calls register_blocks() exactly once
+    per stage, with every task's blocks already combined into one list
+    (see LocalScheduler._run_stage); this is what that call looks like."""
     mgr = ShuffleManager()
     blocks_a = write_shuffle_partition(
         mgr.root_dir, 0, source_task_id=0,
@@ -48,9 +51,34 @@ def test_register_blocks_accumulates_across_multiple_source_tasks():
         records=[{"country": "US", "revenue": 2}], key_fn=key_fn,
         partitioner=HashPartitioner(1),
     )
-    mgr.register_blocks(0, blocks_a)
-    mgr.register_blocks(0, blocks_b)
+    mgr.register_blocks(0, blocks_a + blocks_b)
     assert len(mgr.blocks_for(0, 0)) == 2
+    mgr.cleanup()
+
+
+def test_register_blocks_overwrites_a_stage_registered_twice():
+    """A second register_blocks() call for the same stage_id must replace
+    the first, not accumulate alongside it: this is what lets lineage-
+    based recomputation (execution/scheduler.py's
+    _try_recover_missing_shuffle) re-register a stage's fresh blocks after
+    the original ones were found missing or corrupted, without the stale
+    metadata sticking around and letting a later reader pick it again."""
+    mgr = ShuffleManager()
+    stale = write_shuffle_partition(
+        mgr.root_dir, 0, source_task_id=0,
+        records=[{"country": "US", "revenue": 1}], key_fn=key_fn,
+        partitioner=HashPartitioner(1),
+    )
+    fresh = write_shuffle_partition(
+        mgr.root_dir, 0, source_task_id=1,
+        records=[{"country": "US", "revenue": 2}, {"country": "US", "revenue": 3}],
+        key_fn=key_fn, partitioner=HashPartitioner(1),
+    )
+    mgr.register_blocks(0, stale)
+    mgr.register_blocks(0, fresh)
+    blocks = mgr.blocks_for(0, 0)
+    assert len(blocks) == 1
+    assert blocks[0].source_task_id == 1
     mgr.cleanup()
 
 
