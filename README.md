@@ -8,7 +8,7 @@ Spark replacement, and no performance claim in this repository is made without
 an accompanying, reproducible benchmark (see `docs/benchmarks.md`, added once
 there is something real to measure).
 
-## Status: Milestone 5
+## Status: Milestone 6
 
 Implemented so far:
 
@@ -51,14 +51,19 @@ Implemented so far:
   JSON, to preserve exact types like an `Avg` aggregate's `(sum, count)`
   partial state), and a driver-side `ShuffleManager` tracking which
   blocks exist for which stage/partition, including broadcast reads.
-- **Storage** (`minispark/storage/`): an in-memory `DataSource` and a CSV
-  `DataSource` with schema inference and partitioned, streaming reads.
+- **Storage** (`minispark/storage/`): an in-memory `DataSource`, a CSV
+  `DataSource` with schema inference and partitioned, streaming reads,
+  and a checkpoint `DataSource` (reads back a `Dataset` durably
+  materialized to local disk by `DataFrame.checkpoint()`).
 - **Lazy DataFrame API** (`minispark/api/`): `filter()` / `select()` /
   `group_by()` / `join()` / `order_by()` (alias `sort()`) build plan nodes
   only; `collect()` / `show()` / `count()` / `explain()` are the only
   things that trigger analysis, optimization, and execution.
   `explain(optimized=True)` shows the analyzed, optimized, and physical
-  plans, plus every stage the query splits into.
+  plans, plus every stage the query splits into. `checkpoint()` also
+  triggers execution (eagerly, like `collect()`), then returns a new
+  DataFrame whose plan is a fresh scan over the durably-materialized
+  result, cutting the original plan's lineage at that point.
 - **DAG, stages, and tasks** (`minispark/execution/dag.py`,
   `stages.py`, `tasks.py`): classifies every physical node's dependency
   as narrow or wide (a shuffle `Exchange` is the one wide node), splits a
@@ -75,7 +80,11 @@ Implemented so far:
   `engine.max_task_retries`, moves data between stages through a real
   disk-backed shuffle (including broadcast reads), and merges the last
   stage's results into a `Dataset`. `DataFrame` actions run through this
-  scheduler.
+  scheduler. When a task fails because a prior stage's shuffle blocks are
+  missing or corrupted (not an ordinary failure), the scheduler
+  recomputes that upstream stage from scratch and retries, lineage-based
+  recovery, rather than retrying a read that could never succeed on its
+  own; bounded to at most one recompute per stage per query.
 - **Naive executor** (`minispark/execution/executor.py`) and
   `physical/operators.py`'s whole-Dataset `execute()`: earlier
   milestones' execution paths, kept only as correctness oracles other
@@ -83,12 +92,17 @@ Implemented so far:
 
 Not implemented yet (by design, not oversight): left/right/full outer or
 semi/anti joins, differently-named join keys, sort-merge join,
-cost-based join strategy selection, lineage-based fault recovery,
-checkpointing, columnar execution, SQL, and benchmarking. Every one of
-those has a numbered section in the build spec this project follows and
-lands in its own milestone (or, for the join-scope items, is an explicit,
-documented simplification of Milestone 5's own scope, see
-`logical/nodes.py`'s `Join` docstring).
+cost-based join strategy selection, columnar execution, SQL, and
+benchmarking. Every one of those has a numbered section in the build spec
+this project follows and lands in its own milestone (or, for the
+join-scope items, is an explicit, documented simplification of
+Milestone 5's own scope, see `logical/nodes.py`'s `Join` docstring).
+Within what Milestone 6 does cover: lineage-based recomputation is
+stage-granular (a lost partition is recovered by recomputing its entire
+upstream stage, not just the specific tasks that produced it) and capped
+at one recompute per stage per query; there is no automatic checkpoint
+directory lifetime management, `checkpoint()` never deletes an old
+checkpoint.
 
 ## Quick start
 
@@ -97,6 +111,8 @@ pip install -e ".[dev]"
 pytest
 python examples/basic_dataframe.py
 python examples/aggregations.py
+python examples/joins.py
+python examples/checkpointing.py
 ```
 
 ```python
@@ -122,9 +138,11 @@ See `docs/architecture.md` for the layered design and why each layer
 exists, `docs/query-planning.md` for how a DataFrame call gets from a
 logical plan to a physical plan (analyzer, optimizer, physical plan),
 `docs/execution-model.md` for how that physical plan actually runs (DAG,
-stages, tasks, the local scheduler, and what `local[N]` really does), and
-`docs/shuffle.md` for exactly what happens at a shuffle boundary
-(partial aggregation, hash partitioning, the on-disk block format).
+stages, tasks, the local scheduler, what `local[N]` really does, and how
+lineage-based recomputation and checkpointing work), and `docs/shuffle.md`
+for exactly what happens at a shuffle boundary (partial aggregation,
+hash partitioning, the on-disk block format shared by shuffle blocks and
+checkpoints).
 
 ## Development
 
