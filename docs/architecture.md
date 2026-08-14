@@ -33,18 +33,22 @@ Task Execution
 Storage / Shuffle
 ```
 
-**Milestone 6 status**: every layer above is implemented. `DataFrame`
+**Milestone 7 status**: every layer above is implemented. `DataFrame`
 actions (`collect`/`show`/`count`/`explain`) run, in order:
 `logical/analyzer.py` (validates the plan), `optimizer/optimizer.py`
 (rewrites it), `physical/planner.py` (translates it to a physical plan,
 including turning `group_by(...).agg(...)` into a partial aggregate, a
 shuffle exchange, and a final aggregate; `join(...)` into a shuffle hash
 join or a broadcast join; `order_by(...)` into a local sort, a range
-exchange, and a final sort), `execution/stages.py` (splits it into stages
-at shuffle boundaries; one stage for a shuffle-free plan, two or more for
-a plan with `group_by`/`join`/`order_by`, see `docs/execution-model.md`),
-`execution/scheduler.py`'s `LocalScheduler` (runs each stage's `Task`s,
-either sequentially or across a real `ProcessPoolExecutor` depending on
+exchange, and a final sort; and, before any of that translation, a
+scan-pushdown pass that re-reads a `Scan` with real column/predicate
+hints when the query pattern and the source both allow it, see Key
+Milestone-7 design decisions below and `docs/columnar-storage.md`),
+`execution/stages.py` (splits it into stages at shuffle boundaries; one
+stage for a shuffle-free plan, two or more for a plan with `group_by`/
+`join`/`order_by`, see `docs/execution-model.md`), `execution/
+scheduler.py`'s `LocalScheduler` (runs each stage's `Task`s, either
+sequentially or across a real `ProcessPoolExecutor` depending on
 `local[N]`, moving data between stages through a real disk-backed
 shuffle, see `docs/shuffle.md`). See `docs/execution-model.md` for the
 full DAG/Stage/Task/Worker/Scheduler picture; this file stays focused on
@@ -119,15 +123,20 @@ equivalent unoptimized plan.
   `HashAggregateExec` chain; `Join` becomes one `HashJoinExec` whose
   children are wrapped in `ExchangeExec`s differently depending on the
   `broadcast` hint; `Sort` becomes a local `SortExec` -> range
-  `ExchangeExec` -> final `SortExec` chain, the one physical-planning
-  case that touches data, see Key design decisions below. See
-  `docs/shuffle.md` for all three), `operators.py` (`execute()`, a
-  whole-Dataset oracle only; `execute_partition()`, what a Task actually
-  runs, with a case per physical node type). `ExchangeExec`/
-  `ShuffleWriteExec`/`ShuffleReadExec` are the seam that let
-  `Aggregate`/`Join`/`Sort` each define a wide dependency without
-  duplicating the stage-splitting or shuffle machinery; a future Sort-
-  Merge join would extend the same seam rather than needing a new one.
+  `ExchangeExec` -> final `SortExec` chain; and, as of Milestone 7, a
+  scan-pushdown pass that runs once, before any of the above
+  translation, re-reading a `Scan` with real column/predicate hints
+  wherever the plan shape and the source both allow it. Two different,
+  documented exceptions to "a plan is built without touching data," see
+  Key design decisions below. See `docs/shuffle.md` for the shuffle-
+  based three and `docs/columnar-storage.md` for scan pushdown),
+  `operators.py` (`execute()`, a whole-Dataset oracle only;
+  `execute_partition()`, what a Task actually runs, with a case per
+  physical node type). `ExchangeExec`/`ShuffleWriteExec`/
+  `ShuffleReadExec` are the seam that let `Aggregate`/`Join`/`Sort` each
+  define a wide dependency without duplicating the stage-splitting or
+  shuffle machinery; a future Sort-Merge join would extend the same seam
+  rather than needing a new one.
 
 - **`minispark/shuffle/`**: `partitioner.py` (`HashPartitioner`, used by
   `group_by`/`join`; `RangePartitioner`, used by `order_by()` as of
@@ -139,13 +148,26 @@ equivalent unoptimized plan.
   only.
 
 - **`minispark/storage/`** — `DataSource` (abstract), `MemoryDataSource`,
-  `CSVDataSource`, and, as of Milestone 6, `CheckpointDataSource`/
-  `write_checkpoint()` (reads back a `Dataset` durably materialized to
-  local disk by `DataFrame.checkpoint()`, reusing the same pickled-record
-  block format as a shuffle block, see `docs/shuffle.md`). Depends only
-  on `core/`. A `Scan` logical node holds an already-`.read()` `Dataset`,
-  not a `DataSource` reference, so the logical-plan layer never imports
-  the storage layer's I/O code, only the data model it produces.
+  `CSVDataSource`, `CheckpointDataSource`/`write_checkpoint()` (Milestone
+  6, reads back a `Dataset` durably materialized to local disk by
+  `DataFrame.checkpoint()`, reusing the same pickled-record block format
+  as a shuffle block, see `docs/shuffle.md`), and, as of Milestone 7,
+  `ParquetDataSource`/`write_parquet_dataset()` (real, pyarrow-backed
+  columnar storage; see `docs/columnar-storage.md`). `DataSource.read()`
+  gained two optional pushdown hints this milestone, `columns` and
+  `filter` (an `Expression`), which is a genuine, deliberate widening of
+  this package's dependencies: it now depends on `expressions/` as well
+  as `core/` (a documented deviation from the sketched package
+  structure, not an oversight, see the build spec's "document every
+  deviation" rule). Only `storage/parquet.py` additionally imports
+  `pyarrow`, and only inside methods that are called lazily (never at
+  module import time), since `pyarrow` is an optional extra (`pip
+  install minispark[columnar]`, see pyproject.toml) and nothing outside
+  that one file may require it to be installed. A `Scan` logical node
+  holds an already-`.read()` `Dataset`, not a `DataSource` reference, so
+  the logical-plan layer still never imports the storage layer's I/O
+  code (see logical/nodes.py's `ScanSource` Protocol, Key Milestone-7
+  design decisions below).
 
 - **`minispark/execution/`**: `executor.py` (Milestone 1's naive
   logical-plan interpreter, kept only as a correctness oracle), `dag.py`,
@@ -160,11 +182,19 @@ equivalent unoptimized plan.
   optimization/execution; `checkpoint()`, as of Milestone 6, also
   triggers execution, eagerly, and returns a new `DataFrame` whose plan
   is a fresh `Scan` over the durably-materialized result, see Key
-  Milestone-6 design decisions below), `grouped.py` (`GroupedData`, the
-  result of `group_by()` before `.agg()` turns it back into a
-  `DataFrame`),
-  `MiniSparkSession` (+ builder), `functions.py` (`col()`, `lit()`,
-  `count()`, `sum()`, `avg()`, `min()`, `max()`). `DataFrame.join()`
+  Milestone-6 design decisions below; `write` (Milestone 7) returns a
+  `DataFrameWriter`, `df.write.parquet(path)`, also eager, writing one
+  `.parquet` file per partition, see `docs/columnar-storage.md`),
+  `grouped.py` (`GroupedData`, the result of `group_by()` before
+  `.agg()` turns it back into a `DataFrame`), `writer.py`
+  (`DataFrameWriter`, the write-side mirror of `session.py`'s
+  `DataFrameReader`), `MiniSparkSession` (+ builder), `functions.py`
+  (`col()`, `lit()`, `count()`, `sum()`, `avg()`, `min()`, `max()`).
+  `DataFrameReader.parquet()`/`DataFrameWriter.parquet()` both import
+  `storage/parquet.py` *inside* the method body, not at module top,
+  since `pyarrow` is an optional extra and `import minispark.api.
+  session` alone (to call `.csv()`, say) must never require it.
+  `DataFrame.join()`
   intentionally only accepts `on=` (common column names on both sides),
   matching `Join`'s own scope (see `logical/`, above). `explain(
   optimized=False)` (the default) prints the raw logical plan, matching
@@ -189,6 +219,141 @@ equivalent unoptimized plan.
   `docs/shuffle.md`'s Sort section for when it falls back to one
   partition instead). `execution.partition_size_mb`, `execution.
   shuffle_compression`, and `memory` are still unread.
+
+## Key Milestone-7 design decisions
+
+**"Columnar execution" was scoped to the storage layer, not the whole
+engine.** Milestone 7's build-spec bullet groups four things: columnar
+execution, Parquet, predicate pushdown, projection pruning. The scope
+decision made explicitly before implementing (see the conversation this
+milestone was planned in) was: pyarrow reads Parquet with genuine column
+pruning and genuine row-group-level predicate pushdown (real bytes not
+read), and every physical operator downstream of a Scan, Filter,
+Project, HashAggregateExec, HashJoinExec, SortExec, stays exactly the
+row-at-a-time Python engine that exists today. Fully vectorizing Filter/
+Project to operate on Arrow `RecordBatch`es end to end (falling back to
+rows only at a row-based operator's boundary) was the alternative
+considered and explicitly deferred: it would deliver a more complete
+"columnar execution" claim, but touches `Partition`'s core contract,
+`execute_partition()`, and a large share of existing physical-operator
+tests, a substantially larger and riskier change than one milestone's
+scope justifies here. `Record = dict[str, Any]` remains what every
+physical operator sees; a Parquet-backed partition's `records_fn`
+decodes straight to `Record` dicts (`RecordBatch.to_pylist()`) at the
+partition boundary, and nothing past that point knows or cares the
+source was columnar.
+
+**Real pushdown needed `Scan` to hold onto its `DataSource`, which
+needed a `Protocol`, not an import.** Before this milestone, `Scan`
+(logical/nodes.py) held only an already-`.read()` `Dataset`: the read
+happened once, at DataFrame-construction time (`session.read.csv(path)`
+calls `.read()` immediately), long before the optimizer computes which
+columns/predicates could actually be pushed. Making pushdown real (not
+just plan-shape pruning, Milestone 2's version) requires re-reading with
+those hints once they're known, at physical-planning time, which means
+`Scan` has to keep a handle on the `DataSource` that produced it. But
+`logical/` deliberately never imports `storage/` (see the Milestone-1-era
+package layout note, still true). The fix: `logical/nodes.py` defines a
+structural `ScanSource` `Protocol` (`read(columns=, filter=) -> Dataset`)
+that `storage.datasource.DataSource` satisfies purely by having a
+matching method, no inheritance, no registration, no import from
+`logical/` to `storage/` needed at all. `Scan.source: ScanSource | None`
+defaults to `None`, so every hand-built `Scan(dataset, name)` already in
+the test suite keeps working unchanged; pushdown simply does not apply
+to a `Scan` with no `source`.
+
+**The scan-pushdown pass lives in `physical/planner.py`, runs once per
+plan, not once per recursive call.** Like `Sort`'s range-boundary
+computation (Milestone 5), re-reading a `Scan` with pushdown hints
+touches real I/O, so it cannot live in `optimizer/rules.py`, whose rules
+are held to "never touch data." The first implementation called the
+pushdown pass at the top of the same function `plan_physical()` uses to
+recurse (`_translate()` after this fix); that turned out to call
+`DataSource.read()` a second, redundant time for any Filter/Scan chain
+sitting directly under an `Aggregate`/`Join`/`Sort` (which each make
+their own recursive `plan_physical(child, ...)`-style call on a
+subtree), correct, since re-reading with the same hints is idempotent,
+but wasteful, genuinely reading Parquet twice, not just re-walking a
+tree. Caught before shipping, not after: `plan_physical()` is now a thin
+public entry point that runs the pushdown pass exactly once, over the
+whole plan, then delegates to a separate recursive `_translate()` that
+every internal call site (`_plan_join`, `_plan_aggregate`, `_plan_sort`,
+and the Filter/Project branches) uses instead of calling back into
+`plan_physical()`.
+
+**Pushdown only ever narrows what a Scan reads relative to the query's
+true meaning, and the Filter/Project physical nodes always stay in the
+plan regardless.** Two safety rules, both load-bearing: (1) `columns`
+sent to a source is always at least the union of every Project's and
+every Filter's referenced columns in the chain reaching that Scan
+(`_reread_scan()` unions them defensively even though the recursive walk
+already guarantees it by construction, belt-and-suspenders on purpose);
+a source is free to ignore `columns`/`filter` entirely and still be
+correct, since the row-level `FilterExec`/`ProjectExec` above it are
+never elided, pushdown is always an optimization underneath them, never
+a substitute for their own correctness (see storage/datasource.py's
+`DataSource.read()` docstring). (2) A `Filter`'s condition is only
+carried down through more `Filter`s, never through a `Project`, even a
+plain-column one: a `Filter`'s condition is an `Expression` tied to
+whichever namespace was valid where it was written, and a `Project` is
+exactly a namespace boundary (its output names need not match its
+input's). Carrying a filter expression past one, unchanged, risks
+evaluating it against columns that mean something different underneath,
+or do not exist at all. `columns`, by contrast, is recomputed fresh at
+every `Project` (via `referenced_columns()`, which already walks into
+`Alias`/computed sub-expressions correctly), so it stays correct across
+renames at every level; only `filter_expr` resets to `None` at a
+`Project` boundary. In practice this means predicate pushdown to Parquet
+only fires along a `Filter`-directly-on-`Scan` chain, which is exactly
+what `PredicatePushdown`'s own logical-level rule (Milestone 2) already
+arranges whenever pushing a filter below a `Project` is namespace-safe;
+a `Filter` that rule could not push that far is, correctly, one this
+pass does not push to storage either.
+
+**Predicate translation only ever narrows, via two different
+correctness rules for `And` vs `Or`, and refuses to translate a
+None-literal comparison at all.** `storage/parquet.py`'s
+`translate_predicate()` may push just one side of an `And` (a safe
+superset: the untranslated side still gets checked by the row-level
+Filter that always remains), but must translate *both* sides of an `Or`
+or neither, pushing only one side of an "or" could wrongly exclude rows
+the untranslated side would have kept. A subtler bug, caught by testing
+before it shipped: pyarrow's comparison operators implement SQL's
+three-valued NULL logic (`x == null` never matches, even when `x` is
+itself null), but MiniSpark's row engine evaluates `==`/`!=` as plain
+Python equality, where `None == None` is `True`. Translating
+`col("x") == None` the way pyarrow would evaluate it could therefore
+wrongly *exclude* rows the row-level Filter would have kept, an
+over-exclusion, not merely a missed optimization, the one pushdown
+mistake this design otherwise guards against everywhere else. The fix:
+a `None`-valued `Literal` is treated as untranslatable, not translated
+to a pyarrow null scalar, so any comparison involving it is left
+entirely to the row-level Filter. A related, accepted (not fixed)
+inconsistency: a comparison against a genuinely null *column* value
+(not a `None` literal) makes pyarrow exclude that row silently, while
+the row-based engine, reached without pushdown, would raise `TypeError`
+on the same comparison (`None > 18`, say), a pre-existing limitation of
+row-at-a-time evaluation, not something this milestone introduces or
+attempts to fix; documented in `docs/columnar-storage.md` rather than
+hidden.
+
+**Parquet is partitioned at row-group granularity, not by row range.**
+Unlike CSV (which computes contiguous row ranges from a row count known
+only after a full-file scan), a Parquet file already has a natural,
+independently-readable physical unit: the row group. `ParquetDataSource.
+read()` enumerates every row group across the dataset (via `pyarrow.
+dataset`'s fragment API, `split_by_row_group()`) and assigns them to
+`num_partitions` buckets; each partition's `records_fn` reads only its
+own assigned row groups. This is what makes row-group-level predicate
+skipping observable per-partition, not just in aggregate: a partition
+whose row groups' statistics all fail the pushed filter reads zero rows,
+directly, not merely "fewer" (see `tests/unit/test_parquet_source.py`'s
+row-group-skip test). `ParquetFileFragment` and `pyarrow.dataset.
+Expression` objects are carried directly in the `records_fn` closure
+(not reconstructed from a `(path, row_group_index)` pair inside the
+worker): both were confirmed picklable, including across a real
+`ProcessPoolExecutor` round trip, before relying on that rather than
+assuming it.
 
 ## Key Milestone-6 design decisions
 
@@ -542,28 +707,42 @@ used as dict/set keys for value equality.
 
 ## What's deliberately not here yet
 
-Per the build spec's milestone breakdown: columnar execution, SQL, and
-benchmarking. Each has a numbered section in the build spec and lands in
-the milestone assigned to it, see `README.md`'s status section for the
-current cut line. Within what Milestone 5 does cover: `Join` only
-supports `how="inner"` with common-named `on=` columns (no left/right/
-full outer, no semi/anti, no differently-named join keys); there is no
-sort-merge join, only hash join (broadcast or shuffled); broadcast-vs-
-shuffle join selection is an explicit hint, never automatic;
-`order_by()`'s range partitioning is equal-width over the observed
-min/max, not equal-row-count from a real sample, and only exists for
-numeric sort keys (a string key still sorts correctly, just through a
-single, non-parallel shuffle partition). Within what Milestone 6 does
-cover (see Key Milestone-6 design decisions, below, and
-`docs/execution-model.md`'s "Lineage-based recomputation" and
-"Checkpointing" sections for the full picture): lineage-based
-recomputation is stage-granular, not per-source-task, a lost target
-partition's data is recovered by recomputing its entire upstream stage,
-not just the specific tasks that wrote to it; a stage is recomputed at
-most once per query, a source that is genuinely, permanently unreadable
-still fails the query; and nothing manages checkpoint directory
-lifetime automatically, `DataFrame.checkpoint()` never deletes an old
-checkpoint, that is left to the caller. Nothing spills an in-progress
-aggregate's hash table or sort buffer to disk under memory pressure
-(Milestone 9), and shuffle output is never compressed
-(`ExecutionConfig.shuffle_compression` exists but is unread).
+Per the build spec's milestone breakdown: SQL and benchmarking. Each has
+a numbered section in the build spec and lands in the milestone assigned
+to it, see `README.md`'s status section for the current cut line. Within
+what Milestone 5 does cover: `Join` only supports `how="inner"` with
+common-named `on=` columns (no left/right/full outer, no semi/anti, no
+differently-named join keys); there is no sort-merge join, only hash
+join (broadcast or shuffled); broadcast-vs-shuffle join selection is an
+explicit hint, never automatic; `order_by()`'s range partitioning is
+equal-width over the observed min/max, not equal-row-count from a real
+sample, and only exists for numeric sort keys (a string key still sorts
+correctly, just through a single, non-parallel shuffle partition).
+Within what Milestone 6 does cover (see Key Milestone-6 design
+decisions, below, and `docs/execution-model.md`'s "Lineage-based
+recomputation" and "Checkpointing" sections for the full picture):
+lineage-based recomputation is stage-granular, not per-source-task, a
+lost target partition's data is recovered by recomputing its entire
+upstream stage, not just the specific tasks that wrote to it; a stage is
+recomputed at most once per query, a source that is genuinely,
+permanently unreadable still fails the query; and nothing manages
+checkpoint directory lifetime automatically, `DataFrame.checkpoint()`
+never deletes an old checkpoint, that is left to the caller. Within what
+Milestone 7 does cover (see Key Milestone-7 design decisions, above, and
+`docs/columnar-storage.md`): execution stays row-at-a-time everywhere
+except the Parquet read path itself, there is no vectorized Filter/
+Project operating on Arrow batches; predicate pushdown only fires along
+a Filter-directly-on-Scan chain, never past a Project (a rename/computed
+boundary); pushdown only covers comparisons, `And`/`Or`/`Not`, and
+`IsNull`/`IsNotNull`, arithmetic inside a predicate (`(a + b) > 5`) is
+never pushed; only `bool`/`int`/`float`/`str`/`null` types round-trip
+through Parquet, matching `core/types.py`'s existing closed set, no
+date/timestamp/decimal/nested/list/struct support; row-group-to-
+partition assignment is contiguous chunking, not size- or row-count-
+aware balancing, so a Parquet file with very unevenly sized row groups
+can still produce skewed partitions; and `write.parquet()` always writes
+one file per partition with no target-file-size control or coalescing.
+Nothing spills an in-progress aggregate's hash table or sort buffer to
+disk under memory pressure (Milestone 9), and shuffle output is never
+compressed (`ExecutionConfig.shuffle_compression` exists but is
+unread).
