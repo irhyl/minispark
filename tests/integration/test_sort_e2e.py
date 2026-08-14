@@ -11,11 +11,25 @@ import random
 import pytest
 
 from minispark.api.session import MiniSparkSession
+from minispark.config.config import Config, EngineConfig, MemoryConfig
 from minispark.logical.analyzer import AnalysisException
 
 
 def make_session(master: str = "local[1]"):
     return MiniSparkSession.builder.master(master).app_name("sort_test").get_or_create()
+
+
+def make_spilling_session(master: str = "local[3]"):
+    """A session whose SortExec/HashAggregateExec nodes spill almost
+    immediately (spill_threshold_bytes ~524, see MemoryConfig.
+    spill_threshold_bytes), for tests that need to prove spilling is
+    correct when it runs for real, across real OS worker processes, not
+    just in a single-process unit test."""
+    config = Config(
+        engine=EngineConfig(master=master),
+        memory=MemoryConfig(execution_limit_mb=1, spill_threshold=0.0005),
+    )
+    return MiniSparkSession(config=config, app_name="sort_spill_test")
 
 
 def test_order_by_ascending_local1():
@@ -71,6 +85,42 @@ def test_multi_key_sort_mixed_direction_real_multiprocessing():
     assert [(r["age"], r["score"]) for r in rows] == [
         (r["age"], r["score"]) for r in expected
     ]
+
+
+def test_sort_with_real_spilling_and_real_multiprocessing_matches_reference():
+    """Forces SortExec to actually spill to disk (small spill_threshold_
+    bytes) inside real worker processes (local[3]), and checks the result
+    against a `local[1]`, non-spilling reference session on the same
+    data. This is the scenario the seq-tie-breaker fix in physical/
+    operators.py's `_composite_sort_key` exists for: without it, ties
+    could come out in a different relative order under spilling than
+    without, and this test's key space is deliberately narrow (0..4) so
+    many rows tie on every sort key."""
+    random.seed(23)
+    records = [{"id": i, "k": random.randint(0, 4)} for i in range(80)]
+
+    spilling_session = make_spilling_session("local[3]")
+    df = spilling_session.create_dataframe(records, num_partitions=4)
+    spilled_rows = df.order_by("k").collect()
+
+    reference_session = make_session("local[1]")
+    ref_df = reference_session.create_dataframe(records, num_partitions=4)
+    reference_rows = ref_df.order_by("k").collect()
+
+    assert len(spilled_rows) == len(records) == 80
+    assert [r["k"] for r in spilled_rows] == sorted(r["k"] for r in records)
+    # Within each tied run of equal keys, the *set* of ids must match the
+    # reference exactly (order among ties is not asserted here: unlike
+    # the single-partition seq-tie-breaker test in tests/unit/
+    # test_sort_physical_plan.py, the two sessions here use different
+    # partition counts and worker counts upstream of the final sort, so
+    # "arrival order" itself is expected to differ between them; what
+    # must not differ is which rows exist and their grouping by key).
+    assert sorted(r["id"] for r in spilled_rows) == sorted(r["id"] for r in reference_rows)
+    for k in range(5):
+        spilled_ids = {r["id"] for r in spilled_rows if r["k"] == k}
+        reference_ids = {r["id"] for r in reference_rows if r["k"] == k}
+        assert spilled_ids == reference_ids
 
 
 def test_sort_on_string_column_still_produces_a_correct_global_order():
