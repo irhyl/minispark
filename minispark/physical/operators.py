@@ -14,6 +14,9 @@ cannot do.
 from __future__ import annotations
 
 import functools
+import heapq
+import itertools
+import sys
 from collections.abc import Iterator
 
 from minispark.core.dataset import Dataset
@@ -32,12 +35,27 @@ from minispark.physical.plan import (
     ShuffleReadExec,
     SortExec,
 )
+from minispark.physical.spill import (
+    cleanup_spill_dir,
+    make_spill_dir,
+    read_spill_file,
+    write_spill_file,
+)
+from minispark.shuffle.partitioner import HashPartitioner
 from minispark.shuffle.reader import (
     MissingShuffleDataError,
     ShuffleChecksumError,
     read_shuffle_blocks,
 )
 from minispark.shuffle.writer import ShuffleBlockMeta
+
+# Fixed fan-out for HashAggregateExec's grace-hash spill (see
+# `_execute_hash_aggregate_partition`). Not derived from MemoryConfig or
+# EngineConfig, same reasoning as `physical/plan.py`'s NEVER_SPILL:
+# physical/ does not import config/, and this constant only controls how
+# finely a spilled hash table is split, not whether spilling happens at
+# all (that is `plan.spill_threshold_bytes`).
+_AGGREGATE_SPILL_BUCKETS = 32
 
 # Keyed by source stage_id: a Task whose plan reads from more than one
 # prior stage (a HashJoinExec-rooted stage reads from two) needs each
@@ -199,26 +217,63 @@ def _execute_hash_aggregate_partition(
     partition) has been seen, so the `groups` table below is built up
     front, not lazily inside `records_fn`. This is the same reason a real
     hash-based group-by needs a hash table sized to the *distinct key*
-    count, not the row count; spilling that table to disk under memory
-    pressure (build spec section 22) is not implemented (Milestone 9).
+    count, not the row count.
+
+    Milestone 9 spilling: `groups_bytes` tracks the current in-memory
+    table's estimated size (`_estimate_group_bytes`, incrementally updated
+    as each key's state is replaced, not recomputed from scratch per row).
+    When it crosses `plan.spill_threshold_bytes`, the whole `groups` table
+    is partitioned by `HashPartitioner(_AGGREGATE_SPILL_BUCKETS)` into
+    buckets and each non-empty bucket is written as one spill file
+    (`_spill_groups`), then `groups` is cleared and accumulation resumes.
+    A key spilled once and seen again later simply restarts from
+    `initialize()`/incoming state as if it were new; the two partial
+    states for that key are reconciled later, in the merge phase, via
+    `AggregateFunction.merge()`, exactly the same function that already
+    reconciles states from different source partitions after a shuffle.
+    This is a grace-hash join's spilling strategy applied to group-by
+    instead of join.
+
+    If no spill ever happens, behavior is byte-for-byte what it was
+    before this milestone: `groups` is finalized directly, eagerly, and
+    `records_fn` just replays it.
+
+    If spilling did happen, the still-in-memory remainder is kept as-is
+    (not itself spilled, saving a round-trip) and `records_fn` merges one
+    bucket at a time: for each of the `_AGGREGATE_SPILL_BUCKETS` buckets,
+    it seeds a small dict from the remainder's matching keys, folds in
+    every spill file written for that bucket (across every spill round)
+    via `merge()`, finalizes, and yields, before moving to the next
+    bucket. This bounds memory during the merge phase too, to one
+    bucket's distinct-key set at a time, not the whole partition's.
+    `plan.spill_threshold_bytes` only bounds the accumulation phase; the
+    number of buckets (not size-based) bounds the merge phase, so a
+    single bucket holding a disproportionate share of distinct keys
+    (skew) is not itself protected against here, a known, documented gap
+    left for a future milestone. See `docs/spilling.md`.
     """
     parent = execute_partition(plan.child, partition_id, shuffle_blocks)
     group_by = plan.group_by
     aggregates = [_unwrap_aggregate(a) for a in plan.aggregates]
     group_names = [output_name(g) for g in group_by]
+    threshold = plan.spill_threshold_bytes
+    partitioner = HashPartitioner(_AGGREGATE_SPILL_BUCKETS)
 
     groups: dict[tuple, list] = {}
+    groups_bytes = 0
+    spill_dir: str | None = None
+    spill_paths: list[list[str]] = [[] for _ in range(_AGGREGATE_SPILL_BUCKETS)]
+    round_num = 0
+
     for record in parent:
         key = tuple(g.evaluate(record) for g in group_by)
+        existing = groups.get(key)
         if plan.is_partial:
-            state = groups.get(key) or [agg.initialize() for agg in aggregates]
-            groups[key] = [
-                agg.update(s, record) for agg, s in zip(aggregates, state, strict=True)
-            ]
+            state = existing if existing is not None else [agg.initialize() for agg in aggregates]
+            new_state = [agg.update(s, record) for agg, s in zip(aggregates, state, strict=True)]
         else:
             incoming = [record[f"__agg_state_{i}"] for i in range(len(aggregates))]
-            existing = groups.get(key)
-            groups[key] = (
+            new_state = (
                 incoming
                 if existing is None
                 else [
@@ -226,24 +281,96 @@ def _execute_hash_aggregate_partition(
                     for agg, s, inc in zip(aggregates, existing, incoming, strict=True)
                 ]
             )
+        if existing is not None:
+            groups_bytes -= _estimate_group_bytes(key, existing)
+        groups_bytes += _estimate_group_bytes(key, new_state)
+        groups[key] = new_state
+
+        if groups_bytes >= threshold:
+            if spill_dir is None:
+                spill_dir = make_spill_dir("minispark-aggregate-spill-")
+            _spill_groups(groups, spill_dir, spill_paths, partitioner, round_num)
+            round_num += 1
+            groups = {}
+            groups_bytes = 0
 
     output_schema = plan.schema
     agg_output_names = [output_name(a) for a in plan.aggregates]
 
-    def records_fn() -> Iterator[Record]:
-        for key, state in groups.items():
-            row: Record = dict(zip(group_names, key, strict=True))
-            if plan.is_partial:
-                for i, s in enumerate(state):
-                    row[f"__agg_state_{i}"] = s
-            else:
-                for name, agg, s in zip(agg_output_names, aggregates, state, strict=True):
-                    row[name] = agg.finalize(s)
-            yield row
+    if spill_dir is None:
 
-    return Partition(
-        partition_id, output_schema, records_fn, PartitionMetadata(row_count=len(groups))
-    )
+        def records_fn() -> Iterator[Record]:
+            for key, state in groups.items():
+                row: Record = dict(zip(group_names, key, strict=True))
+                if plan.is_partial:
+                    for i, s in enumerate(state):
+                        row[f"__agg_state_{i}"] = s
+                else:
+                    for name, agg, s in zip(agg_output_names, aggregates, state, strict=True):
+                        row[name] = agg.finalize(s)
+                yield row
+
+        return Partition(
+            partition_id, output_schema, records_fn, PartitionMetadata(row_count=len(groups))
+        )
+
+    remainder = groups
+
+    def spilled_records_fn() -> Iterator[Record]:
+        try:
+            remainder_by_bucket: list[dict[tuple, list]] = [
+                {} for _ in range(_AGGREGATE_SPILL_BUCKETS)
+            ]
+            for key, state in remainder.items():
+                remainder_by_bucket[partitioner.partition_for(key)][key] = state
+
+            for bucket in range(_AGGREGATE_SPILL_BUCKETS):
+                merged = remainder_by_bucket[bucket]
+                for path in spill_paths[bucket]:
+                    for key, state in read_spill_file(path):
+                        existing = merged.get(key)
+                        merged[key] = (
+                            state
+                            if existing is None
+                            else [
+                                agg.merge(s, inc)
+                                for agg, s, inc in zip(aggregates, existing, state, strict=True)
+                            ]
+                        )
+                for key, state in merged.items():
+                    row: Record = dict(zip(group_names, key, strict=True))
+                    if plan.is_partial:
+                        for i, s in enumerate(state):
+                            row[f"__agg_state_{i}"] = s
+                    else:
+                        for name, agg, s in zip(agg_output_names, aggregates, state, strict=True):
+                            row[name] = agg.finalize(s)
+                    yield row
+        finally:
+            cleanup_spill_dir(spill_dir)
+
+    return Partition(partition_id, output_schema, spilled_records_fn, PartitionMetadata())
+
+
+def _spill_groups(
+    groups: dict[tuple, list],
+    spill_dir: str,
+    spill_paths: list[list[str]],
+    partitioner: HashPartitioner,
+    round_num: int,
+) -> None:
+    """Partition `groups` by key hash and write each non-empty bucket as
+    one spill file, appending its path to that bucket's entry in
+    `spill_paths` (mutated in place). `round_num` only distinguishes file
+    names across repeated calls in the same spill directory; nothing
+    reads it back out, the merge phase groups by bucket and does not care
+    which round a file came from."""
+    by_bucket: dict[int, list[tuple[tuple, list]]] = {}
+    for key, state in groups.items():
+        by_bucket.setdefault(partitioner.partition_for(key), []).append((key, state))
+    for bucket, items in by_bucket.items():
+        path = write_spill_file(spill_dir, f"round{round_num}_bucket{bucket}.pkl", items)
+        spill_paths[bucket].append(path)
 
 
 def _execute_shuffle_read_partition(
@@ -326,32 +453,119 @@ def _execute_sort_partition(
 ) -> Partition:
     """Sort this one partition's rows by `plan.sort_exprs`/`plan.ascending`.
 
-    Like HashAggregateExec, this cannot stream: the whole partition must
-    be seen before any row's final position is known, so rows are
-    materialized up front. Multi-key, mixed ascending/descending order is
-    achieved with repeated stable sorts, last key first (Python's `sort`
-    is guaranteed stable, so an earlier pass's relative order survives
-    for rows that tie on a later, higher-priority key): a single
-    `sorted(key=...)` call sorting on a tuple of keys cannot vary
-    direction per key without either negating values (which breaks for
-    non-numeric types like strings) or a custom comparator (removed from
-    Python 3's `sorted`).
+    Like HashAggregateExec, this cannot stream in the general case: the
+    whole partition must be seen before any row's final position is
+    known. Rows accumulate into an in-memory buffer; `_sort_rows()` (used
+    both here and to sort each spilled run) achieves multi-key, mixed
+    ascending/descending order with repeated stable sorts, last key
+    first (Python's `sort` is guaranteed stable, so an earlier pass's
+    relative order survives for rows that tie on a later, higher-
+    priority key): a single `sorted(key=...)` call sorting on a tuple of
+    keys cannot vary direction per key without either negating values
+    (which breaks for non-numeric types like strings) or a custom
+    comparator (removed from Python 3's `sorted`).
 
     Nulls always sort last, regardless of ascending/descending: a
     deliberate, documented simplification rather than implementing
     per-column NULLS FIRST/LAST placement.
+
+    Milestone 9 spilling: if the buffer's estimated size (`sys.
+    getsizeof`-summed, the same heuristic and "not an exact byte count"
+    caveat as `execution/worker.py`'s `_estimate_bytes`) crosses `plan.
+    spill_threshold_bytes`, the buffer is sorted with `_sort_rows()` and
+    written to a spill file (`physical/spill.py`) as one sorted run, then
+    cleared; this can repeat any number of times. If no spill ever
+    happens, behavior is byte-for-byte what it was before this milestone
+    (sort the one in-memory list, return it eagerly).
+
+    If spilling did happen, the final, still-in-memory remainder is
+    itself sorted into one more run, and every run (spilled files plus
+    the final in-memory one) is merged with `heapq.merge()`, streaming
+    its output lazily rather than materializing it, a real (if
+    incidental) benefit of the spilling path over the non-spilling one.
+    Every record is tagged with a strictly increasing `seq` as it is
+    first consumed from `parent`, carried through buffering/spilling as
+    `(seq, record)`, specifically so the merge can break a full tie (on
+    every sort key) by original arrival order, exactly matching what a
+    single stable, non-spilling sort already does for free: `heapq.
+    merge()` only preserves order *within* one already-sorted input and
+    resolves cross-input ties by *input position in the runs list*, not
+    by any property of the records themselves, so without `seq` as an
+    explicit final tie-breaker in `_composite_sort_key()`, two tied rows
+    that happened to land in different spill chunks could come out in a
+    different relative order than the same query would produce without
+    spilling, an internal, invisible-to-the-plan performance knob
+    silently changing an observable result. Caught by testing (`tests/
+    unit/test_sort_physical_plan.py` compares spilling and non-spilling
+    output on the same data directly), not inspection: an earlier version
+    without the `seq` tie-breaker passed every test that did not
+    specifically construct enough full ties to expose it. See
+    `docs/spilling.md`.
     """
     parent = execute_partition(plan.child, partition_id, shuffle_blocks)
-    rows = list(parent)
-    for expr, ascending in reversed(list(zip(plan.sort_exprs, plan.ascending, strict=True))):
-        key_fn = functools.partial(_null_last_sort_key, expr, ascending)
-        rows.sort(key=key_fn, reverse=not ascending)
+    threshold = plan.spill_threshold_bytes
+    seq_counter = itertools.count()
+
+    buffer: list[tuple[int, Record]] = []
+    buffer_bytes = 0
+    total_rows = 0
+    spill_dir: str | None = None
+    spill_paths: list[str] = []
+
+    for record in parent:
+        buffer.append((next(seq_counter), record))
+        buffer_bytes += _estimate_record_bytes(record)
+        total_rows += 1
+        if buffer_bytes >= threshold:
+            if spill_dir is None:
+                spill_dir = make_spill_dir("minispark-sort-spill-")
+            sorted_chunk = _sort_rows(buffer, plan.sort_exprs, plan.ascending)
+            spill_paths.append(
+                write_spill_file(spill_dir, f"run_{len(spill_paths)}.pkl", sorted_chunk)
+            )
+            buffer = []
+            buffer_bytes = 0
+
+    if not spill_paths:
+        sorted_rows = _sort_rows(buffer, plan.sort_exprs, plan.ascending)
+        return Partition(
+            partition_id,
+            plan.schema,
+            functools.partial(iter, (record for _, record in sorted_rows)),
+            PartitionMetadata(row_count=len(sorted_rows)),
+        )
+
+    final_run = _sort_rows(buffer, plan.sort_exprs, plan.ascending)
+    key_fn = functools.partial(_composite_sort_key, plan.sort_exprs, plan.ascending)
+
+    def records_fn() -> Iterator[Record]:
+        try:
+            runs = [iter(final_run), *(read_spill_file(p) for p in spill_paths)]
+            for _, record in heapq.merge(*runs, key=key_fn):
+                yield record
+        finally:
+            cleanup_spill_dir(spill_dir)
+
     return Partition(
-        partition_id,
-        plan.schema,
-        functools.partial(iter, rows),
-        PartitionMetadata(row_count=len(rows)),
+        partition_id, plan.schema, records_fn, PartitionMetadata(row_count=total_rows)
     )
+
+
+def _sort_rows(
+    rows: list[tuple[int, Record]], sort_exprs: list[Expression], ascending: list[bool]
+) -> list[tuple[int, Record]]:
+    """Sort `(seq, record)` pairs (a new list; `rows` itself is sorted in
+    place and returned, matching `list.sort()`'s own contract) via
+    repeated stable passes, last key first. See `_execute_sort_partition`'s
+    docstring for why this technique, not a single composite key, is
+    used here, and why `seq` rides along even though it plays no part in
+    *this* function's own comparisons (Python's stable sort already
+    preserves `rows`' incoming relative order for a full tie, which is
+    exactly `seq` order, since `rows` is always built in arrival order)."""
+    for expr, asc in reversed(list(zip(sort_exprs, ascending, strict=True))):
+        key_fn = functools.partial(_null_last_sort_key, expr, asc)
+        rows.sort(key=lambda pair: key_fn(pair[1]), reverse=not asc)
+    return rows
 
 
 def _null_last_sort_key(expr: Expression, ascending: bool, record: Record) -> tuple[bool, object]:
@@ -364,3 +578,71 @@ def _null_last_sort_key(expr: Expression, ascending: bool, record: Record) -> tu
     # descending column too, not only for an ascending one.
     null_sentinel = is_null if ascending else not is_null
     return (null_sentinel, value if not is_null else 0)
+
+
+class _Desc:
+    """Wraps a value so tuple/heapq comparison treats it as descending,
+    without negating the value itself (which breaks for non-numeric
+    types like strings, see `_execute_sort_partition`'s docstring).
+    Delegates to the wrapped value's own `<`/`==`, just flipped; works
+    for any orderable type the wrapped value itself supports."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: object):
+        self.value = value
+
+    def __lt__(self, other: _Desc) -> bool:
+        return other.value < self.value  # type: ignore[operator]
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Desc) and self.value == other.value
+
+
+def _composite_sort_key(
+    sort_exprs: list[Expression], ascending: list[bool], pair: tuple[int, Record]
+) -> tuple:
+    """One comparable key per `(seq, record)` pair capturing the full
+    multi-key, mixed-direction, null-last order, plus `seq` as a final
+    tie-breaker, in a single tuple, for `heapq.merge()`'s `key=` (which
+    needs one monotonic key comparable across every run being merged,
+    unlike `_sort_rows()`'s repeated-pass technique, which only needs to
+    compare within a single list at a time). Sorting by the sort-key
+    portion of this tuple is mathematically equivalent to `_sort_rows()`'s
+    "stable-sort last key first" for the same reason lexicographic tuple
+    comparison is always equivalent to that technique for multi-key sort;
+    appending `seq` last reproduces stable-sort's tie-breaking (original
+    arrival order) explicitly, since `heapq.merge()`, unlike a single
+    `list.sort()`, has no other way to know which of two equal-keyed rows
+    from *different* runs arrived first. `tests/unit/
+    test_sort_physical_plan.py` checks this produces orderings identical
+    to `_sort_rows()`, including for full ties, directly, not just
+    assumes it.
+    """
+    seq, record = pair
+    parts: list[object] = []
+    for expr, asc in zip(sort_exprs, ascending, strict=True):
+        value = expr.evaluate(record)
+        is_null = value is None
+        placeholder = 0 if is_null else value
+        parts.append(is_null)
+        parts.append(placeholder if asc else _Desc(placeholder))
+    parts.append(seq)
+    return tuple(parts)
+
+
+def _estimate_record_bytes(record: Record) -> int:
+    """Rough, Python-object-overhead-inclusive estimate, not an on-disk
+    byte count. Same heuristic and same caveat as `execution/worker.py`'s
+    `_estimate_bytes` and `optimizer/statistics.py`'s `compute_statistics`."""
+    return sum(sys.getsizeof(v) for v in record.values())
+
+
+def _estimate_group_bytes(key: tuple, state: list) -> int:
+    """Rough estimate of one group's contribution to the in-memory hash
+    table's size (key tuple plus aggregate state list), same `sys.
+    getsizeof`-summed heuristic as `_estimate_record_bytes`. Shallow, not
+    recursive: a state holding a large nested container (no built-in
+    aggregate in expressions/aggregate.py does; a hypothetical
+    `collect_list` would) is under-counted, same caveat as elsewhere."""
+    return sum(sys.getsizeof(v) for v in key) + sum(sys.getsizeof(v) for v in state)
