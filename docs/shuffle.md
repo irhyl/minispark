@@ -1,7 +1,7 @@
 # Shuffle
 
 How `group_by(...).agg(...)`, `join(...)`, and `order_by(...)` move data
-between partitions, as of Milestone 5. See `docs/execution-model.md` for
+between partitions, as of Milestone 6. See `docs/execution-model.md` for
 narrow vs wide dependencies and how a wide dependency becomes a stage
 boundary in general; this document is specifically about what happens at
 that boundary, and how the three operators above differ in what they
@@ -179,6 +179,25 @@ across the round trip. Each block's metadata
 incrementally as it is written. A block's checksum is verified against
 its bytes on read by default (`shuffle/reader.py`); a mismatch raises
 `ShuffleChecksumError` rather than silently returning corrupted rows.
+A missing block file (the file itself is gone, e.g. deleted, rather than
+present but corrupted) raises the standard library's `FileNotFoundError`
+at the same point. `physical/operators.py`'s `_execute_shuffle_read_partition`
+catches both and re-raises them as one `MissingShuffleDataError`
+(`shuffle/reader.py`), naming which stage and target partition could not
+be read: see `docs/execution-model.md`'s "Lineage-based recomputation"
+(Milestone 6) for what the scheduler does with that, recompute the stage
+that produced the missing data, not just retry the read that failed.
+
+`storage/checkpoint.py`'s checkpoint files (`DataFrame.checkpoint()`,
+also Milestone 6) reuse this exact same back-to-back-pickle format, one
+file per partition, for the same reason: it is a durable, exact,
+type-preserving way to persist a sequence of Records and read them back,
+and that need is identical whether the records are one target
+partition's shuffle output or a whole checkpointed partition. Checkpoint
+files are not shuffle blocks, though: they carry no `ShuffleBlockMeta`,
+no checksum, and are not registered with a `ShuffleManager` or cleaned up
+at the end of a query, see `docs/execution-model.md`'s "Checkpointing"
+for why.
 
 Writing streams one record at a time to whichever target file it belongs
 to (an open file handle and a running checksum per target partition is
@@ -206,6 +225,18 @@ list(s) it needs as plain data on its `Task` (`execution/tasks.py`'s
 `shuffle_blocks: dict[stage_id, list[ShuffleBlockMeta]]` field, one entry
 per upstream stage it reads from), not a reference to a live
 `ShuffleManager`.
+
+`register_blocks(stage_id, blocks)` *overwrites* whatever was already
+registered for that `stage_id`, rather than accumulating; a stage is
+still only ever registered once from its own normal run (with every one
+of that stage's tasks' blocks combined into a single call). The reason
+it needs to be overwrite, not append, is Milestone 6's lineage-based
+recomputation (`docs/execution-model.md`): recomputing a stage whose
+blocks were found missing calls `register_blocks` a second time for the
+same `stage_id`, with the fresh blocks it just produced, and those must
+fully replace the stale metadata (pointing at files that are gone or
+corrupt), not sit alongside it and risk a later reader picking the stale
+entry again.
 
 ## How this fits into stages and tasks
 
