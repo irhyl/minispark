@@ -148,12 +148,6 @@ python -m benchmarks.spilling         # the wall-clock cost of spilling to disk
 | `docs/distributed-readiness.md` | What would and wouldn't need to change for multi-machine execution |
 | `docs/benchmarks.md` | Every benchmark number and its caveats |
 
-## Status
-
-All ten milestones in `docs/build-spec.md` are implemented, including the final one, which the spec itself scopes as an architecture-readiness analysis rather than an implementation.
-
-Not implemented, by design: left/right/full outer or semi/anti joins, differently-named join keys, sort-merge join, cost-based join strategy selection, and any real network communication or cloud deployment. Reasoning for each is in `docs/architecture.md`'s "What's deliberately not here yet."
-
 ## License
 
 MIT. See [LICENSE](LICENSE).
