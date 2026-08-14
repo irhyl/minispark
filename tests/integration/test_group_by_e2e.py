@@ -123,6 +123,40 @@ def test_group_by_real_multiprocessing_matches_reference():
         assert rows[country]["total"] == sum(r["revenue"] for r in group_rows)
 
 
+def test_group_by_agg_then_order_by_matches_reference():
+    """Regression test: `group_by(...).agg(...).order_by(...)`, the exact
+    shape in the build spec's own "Definition of done" example, used to
+    crash physical planning with `NotImplementedError` (see
+    tests/unit/test_sort_physical_plan.py's `test_single_partition_
+    fallback_when_sort_child_is_an_aggregate` for the physical-plan-level
+    regression test; this one checks the actual end-to-end result through
+    the real DataFrame path, with `shuffle_partitions` high enough that a
+    working fix's single-partition fallback is genuinely exercised, not
+    trivially satisfied)."""
+    session = make_session("local[1]")
+    records = [
+        {"country": "US", "revenue": 10},
+        {"country": "CA", "revenue": 30},
+        {"country": "US", "revenue": 20},
+        {"country": "UK", "revenue": 7},
+        {"country": "CA", "revenue": 2},
+    ]
+    df = session.create_dataframe(records, num_partitions=2)
+    result = df.group_by("country").agg(ssum("revenue").alias("total")).order_by(
+        "total", ascending=False
+    )
+    rows = result.collect()
+
+    reference = _reference_group_by(records, key_fn=lambda r: r["country"])
+    expected_totals = {
+        country: sum(r["revenue"] for r in group_rows) for country, group_rows in reference.items()
+    }
+    assert [r["country"] for r in rows] == sorted(
+        expected_totals, key=lambda c: expected_totals[c], reverse=True
+    )
+    assert [r["total"] for r in rows] == sorted(expected_totals.values(), reverse=True)
+
+
 def test_group_by_with_real_spilling_and_real_multiprocessing_matches_reference():
     """Forces both the partial and final HashAggregateExec stages to
     actually spill to disk (small spill_threshold_bytes) inside real
