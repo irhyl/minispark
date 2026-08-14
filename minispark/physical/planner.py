@@ -74,6 +74,7 @@ from minispark.logical.nodes import (
 from minispark.optimizer.statistics import compute_statistics
 from minispark.physical.operators import execute as execute_whole_dataset
 from minispark.physical.plan import (
+    NEVER_SPILL,
     ExchangeExec,
     FilterExec,
     HashAggregateExec,
@@ -88,7 +89,9 @@ DEFAULT_SHUFFLE_PARTITIONS = 4
 
 
 def plan_physical(
-    logical_plan: LogicalPlan, shuffle_partitions: int = DEFAULT_SHUFFLE_PARTITIONS
+    logical_plan: LogicalPlan,
+    shuffle_partitions: int = DEFAULT_SHUFFLE_PARTITIONS,
+    spill_threshold_bytes: int = NEVER_SPILL,
 ) -> PhysicalPlan:
     """Public entry point: run the scan-pushdown pass exactly once, over
     the whole plan, then translate.
@@ -105,33 +108,44 @@ def plan_physical(
     a wasted tree-walk. Running the pass once, here, and having every
     internal recursive site call `_translate()` instead of
     `plan_physical()`, is what avoids that.
+
+    `spill_threshold_bytes` (Milestone 9, default `NEVER_SPILL`) is baked
+    into every `HashAggregateExec`/`SortExec` this call builds; see
+    `docs/spilling.md`. `api/dataframe.py` is the only caller that passes
+    a real, configured value (`MemoryConfig.spill_threshold_bytes`); every
+    other caller (tests, `explain()`'s own internal call before this
+    milestone) gets the "never spill" default unless it opts in.
     """
-    return _translate(_pushdown_scan_reads(logical_plan), shuffle_partitions)
+    return _translate(
+        _pushdown_scan_reads(logical_plan), shuffle_partitions, spill_threshold_bytes
+    )
 
 
-def _translate(logical_plan: LogicalPlan, shuffle_partitions: int) -> PhysicalPlan:
+def _translate(
+    logical_plan: LogicalPlan, shuffle_partitions: int, spill_threshold_bytes: int
+) -> PhysicalPlan:
     if isinstance(logical_plan, Scan):
         return ScanExec(logical_plan.dataset, logical_plan.source_name)
     if isinstance(logical_plan, Filter):
-        child = _translate(logical_plan.child, shuffle_partitions)
+        child = _translate(logical_plan.child, shuffle_partitions, spill_threshold_bytes)
         return FilterExec(child, logical_plan.condition)
     if isinstance(logical_plan, Project):
-        child = _translate(logical_plan.child, shuffle_partitions)
+        child = _translate(logical_plan.child, shuffle_partitions, spill_threshold_bytes)
         return ProjectExec(child, logical_plan.columns, logical_plan.schema)
     if isinstance(logical_plan, Aggregate):
-        return _plan_aggregate(logical_plan, shuffle_partitions)
+        return _plan_aggregate(logical_plan, shuffle_partitions, spill_threshold_bytes)
     if isinstance(logical_plan, Join):
-        return _plan_join(logical_plan, shuffle_partitions)
+        return _plan_join(logical_plan, shuffle_partitions, spill_threshold_bytes)
     if isinstance(logical_plan, Sort):
-        return _plan_sort(logical_plan, shuffle_partitions)
+        return _plan_sort(logical_plan, shuffle_partitions, spill_threshold_bytes)
     raise NotImplementedError(
         f"No physical strategy implemented for logical node {type(logical_plan).__name__}"
     )
 
 
-def _plan_join(join: Join, shuffle_partitions: int) -> PhysicalPlan:
-    left_physical = _translate(join.left, shuffle_partitions)
-    right_physical = _translate(join.right, shuffle_partitions)
+def _plan_join(join: Join, shuffle_partitions: int, spill_threshold_bytes: int) -> PhysicalPlan:
+    left_physical = _translate(join.left, shuffle_partitions, spill_threshold_bytes)
+    right_physical = _translate(join.right, shuffle_partitions, spill_threshold_bytes)
     left_keys: list[Expression] = [Column(name) for name in join.on]
     right_keys: list[Expression] = [Column(name) for name in join.on]
 
@@ -147,18 +161,26 @@ def _plan_join(join: Join, shuffle_partitions: int) -> PhysicalPlan:
     return HashJoinExec(left_side, right_side, left_keys, right_keys, join.on, join.schema)
 
 
-def _plan_aggregate(agg: Aggregate, shuffle_partitions: int) -> PhysicalPlan:
-    child_physical = _translate(agg.child, shuffle_partitions)
+def _plan_aggregate(
+    agg: Aggregate, shuffle_partitions: int, spill_threshold_bytes: int
+) -> PhysicalPlan:
+    child_physical = _translate(agg.child, shuffle_partitions, spill_threshold_bytes)
     partial = HashAggregateExec(
         child_physical,
         agg.group_by,
         agg.aggregates,
         schema=_partial_aggregate_schema(agg.group_by, agg.aggregates, agg.child.schema),
         is_partial=True,
+        spill_threshold_bytes=spill_threshold_bytes,
     )
     exchange = ExchangeExec(partial, shuffle_partitions, agg.group_by)
     return HashAggregateExec(
-        exchange, agg.group_by, agg.aggregates, schema=agg.schema, is_partial=False
+        exchange,
+        agg.group_by,
+        agg.aggregates,
+        schema=agg.schema,
+        is_partial=False,
+        spill_threshold_bytes=spill_threshold_bytes,
     )
 
 
@@ -187,8 +209,8 @@ def _column_type(expr: Expression, schema: Schema) -> DataType:
     return STRING
 
 
-def _plan_sort(sort: Sort, shuffle_partitions: int) -> PhysicalPlan:
-    child_physical = _translate(sort.child, shuffle_partitions)
+def _plan_sort(sort: Sort, shuffle_partitions: int, spill_threshold_bytes: int) -> PhysicalPlan:
+    child_physical = _translate(sort.child, shuffle_partitions, spill_threshold_bytes)
     primary_key = sort.sort_exprs[0]
     primary_ascending = sort.ascending[0]
     # The analyzer (logical/analyzer.py's _analyze_sort) already rejected
@@ -198,11 +220,15 @@ def _plan_sort(sort: Sort, shuffle_partitions: int) -> PhysicalPlan:
     boundaries, num_partitions, partition_key = _sort_range_boundaries(
         child_physical, primary_key, primary_ascending, sort.child.schema, shuffle_partitions
     )
-    local_sort = SortExec(child_physical, sort.sort_exprs, sort.ascending, sort.child.schema)
+    local_sort = SortExec(
+        child_physical, sort.sort_exprs, sort.ascending, sort.child.schema, spill_threshold_bytes
+    )
     exchange = ExchangeExec(
         local_sort, num_partitions, [partition_key], range_boundaries=boundaries
     )
-    return SortExec(exchange, sort.sort_exprs, sort.ascending, sort.schema)
+    return SortExec(
+        exchange, sort.sort_exprs, sort.ascending, sort.schema, spill_threshold_bytes
+    )
 
 
 def _sort_range_boundaries(
