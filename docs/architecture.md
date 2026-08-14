@@ -658,9 +658,11 @@ real shuffle block file deleted from real disk mid-query, under real
 `local[2]` multiprocessing, confirmed recoverable by the scheduler
 alone. This is flagged explicitly rather than claiming this proves
 executor-loss recovery in the distributed sense, it proves recovery from
-lost *data*, which is the part of the mechanism that generalizes; true
-multi-machine executor loss is Milestone 10 territory (remote worker
-architecture readiness).
+lost *data*, which is the part of the mechanism that generalizes; see
+`docs/distributed-readiness.md` for exactly how far that generalization
+goes and where it stops (the recovery logic itself is already
+indifferent to why data went missing, but nothing detects "a remote
+worker is unreachable" as a reason yet).
 
 **Checkpointing reuses the shuffle block format instead of inventing a
 second on-disk record format.** `storage/checkpoint.py` writes one file
@@ -954,10 +956,15 @@ used as dict/set keys for value equality.
 
 ## What's deliberately not here yet
 
-Remote-worker architecture readiness: real network communication and
-cloud deployment, not implemented until the local engine is stable, per
-the build spec. See `README.md`'s status section for the current cut
-line. Within what Milestone 5 does cover:
+Real network communication and cloud deployment: no networking, RPC, or
+remote worker code exists, and `EngineConfig.master` still only accepts
+`"local[N]"`, per the build spec's own explicit scoping. See
+`docs/distributed-readiness.md` for the architecture analysis of what
+already would not need to change for that (task/result picklability, the
+checksummed shuffle block format, the stage-granular lineage recovery
+design) versus what genuinely does not exist yet (a worker addressing
+scheme, a fetch-over-network shuffle read path, a safer wire format than
+trusted-same-machine pickle). Within what Milestone 5 does cover:
 `Join` only supports `how="inner"` with
 common-named `on=` columns (no left/right/full outer, no semi/anti, no
 differently-named join keys); there is no sort-merge join, only hash
