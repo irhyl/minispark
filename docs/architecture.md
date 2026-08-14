@@ -33,7 +33,7 @@ Task Execution
 Storage / Shuffle
 ```
 
-**Milestone 8 status**: every layer above is implemented. A `DataFrame`
+**Current status**: every layer above is implemented. A `DataFrame`
 is built either by chaining API calls or by `session.sql(...)` parsing
 SQL text into the identical logical plan (`sql/parser.py`, see
 `docs/sql.md`); from that point on the two are indistinguishable.
@@ -46,12 +46,16 @@ join or a broadcast join; `order_by(...)` into a local sort, a range
 exchange, and a final sort; and, before any of that translation, a
 scan-pushdown pass that re-reads a `Scan` with real column/predicate
 hints when the query pattern and the source both allow it, see Key
-Milestone-7 design decisions below and `docs/columnar-storage.md`),
-`execution/stages.py` (splits it into stages at shuffle boundaries; one
-stage for a shuffle-free plan, two or more for a plan with `group_by`/
-`join`/`order_by`, see `docs/execution-model.md`), `execution/
-scheduler.py`'s `LocalScheduler` (runs each stage's `Task`s, either
-sequentially or across a real `ProcessPoolExecutor` depending on
+Milestone-7 design decisions below and `docs/columnar-storage.md`), each
+`SortExec`/`HashAggregateExec` node carrying a `spill_threshold_bytes`
+(from `MemoryConfig`, see Key spilling and CSV byte-offset design
+decisions below and `docs/spilling.md`) that governs whether it spills
+to local disk during
+execution, `execution/stages.py` (splits it into stages at shuffle
+boundaries; one stage for a shuffle-free plan, two or more for a plan
+with `group_by`/`join`/`order_by`, see `docs/execution-model.md`),
+`execution/scheduler.py`'s `LocalScheduler` (runs each stage's `Task`s,
+either sequentially or across a real `ProcessPoolExecutor` depending on
 `local[N]`, moving data between stages through a real disk-backed
 shuffle, see `docs/shuffle.md`, and building a `QueryMetrics` summary
 along the way, see Key Milestone-8 design decisions below and
@@ -246,6 +250,116 @@ equivalent unoptimized plan.
   `docs/shuffle.md`'s Sort section for when it falls back to one
   partition instead). `execution.partition_size_mb`, `execution.
   shuffle_compression`, and `memory` are still unread.
+
+## Key spilling and CSV byte-offset design decisions
+
+**`spill_threshold_bytes` is a computed property on `MemoryConfig`, and
+`physical/` gets it as a plain `int`, never a `MemoryConfig` reference.**
+`MemoryConfig.spill_threshold_bytes` derives from `execution_limit_mb`
+and `spill_threshold` the same way `EngineConfig.num_workers` derives
+from `master`, a single source of truth instead of two fields that could
+drift apart. `api/dataframe.py` reads it and passes a bare `int` into
+`physical/planner.py`, which bakes it into every `HashAggregateExec`/
+`SortExec` node it builds; `physical/` still never imports `config/`
+(the same layering rule Key Milestone-4/5 decisions already establish
+for `shuffle_partitions`). A hand-built physical node in an existing
+test that does not pass `spill_threshold_bytes` gets `NEVER_SPILL`
+(`2**62`, a module constant in `physical/plan.py`, not derived from
+`MemoryConfig`), so every test and call site that does not explicitly
+configure a threshold keeps its exact never-spills behavior with no
+code changes required.
+
+**A real correctness bug in sort spilling was caught by testing, not
+inspection, and is the reason every spilled record carries a sequence
+number.** `_execute_sort_partition`'s (`physical/operators.py`) external
+merge sort buffers rows, spills a sorted run to disk when the buffer
+crosses `spill_threshold_bytes`, and merges every run (spilled plus the
+final in-memory one) with `heapq.merge()`. An early version merged
+`(sort key) -> record` directly; a test comparing spilled output against
+non-spilled output on the same data, with enough full ties (every sort
+key equal) to matter, found the two disagreed on tie order. Root cause:
+`heapq.merge()` breaks a tie between two equal-keyed elements from
+*different* input runs by each run's position in the merge, not by
+anything about the records themselves, so two tied rows that happened to
+land in different spill chunks could come out in a different relative
+order than a single, non-spilling stable sort would produce for the
+identical data, an internal, invisible-to-the-plan performance knob
+(spill or not) silently changing an observable query result. Fixed by
+tagging every record with a strictly increasing `seq` as it is first read
+from the child, threading `(seq, record)` pairs through buffering and
+spilling, and appending `seq` as the final element of the merge key
+(`_composite_sort_key`), reproducing what stable-sort tie-breaking
+already gives for free in the non-spilling path. `tests/unit/
+test_sort_physical_plan.py`'s `test_spilling_produces_same_result_as_
+non_spilling_on_random_data` is this exact regression test, kept in the
+suite rather than deleted once the fix landed, since the earlier,
+buggy version "passed every test that did not specifically construct
+enough full ties to expose it" (see the docstring on `_execute_sort_
+partition`), and only a test built to construct that condition on
+purpose is a real guard against it recurring.
+
+**Grace-hash aggregate spilling resets the *whole* in-memory table on
+each spill, not just the excess, trading spill I/O for a simpler, still
+memory-bounded merge phase.** `_execute_hash_aggregate_partition`
+partitions the current `groups` dict into `_AGGREGATE_SPILL_BUCKETS`
+(32, a fixed fan-out, not derived from any config) buckets by key hash
+and writes each non-empty bucket to disk, then clears `groups` entirely
+and resumes accumulating; a key spilled once and seen again later
+restarts from `initialize()`/incoming state rather than being looked up
+and updated in place, with the two partial results reconciled later, in
+the merge phase, via the same `AggregateFunction.merge()` that already
+reconciles states from different source partitions after a real shuffle.
+The alternative considered and rejected was spilling only the excess (a
+smaller, incremental spill), which would need either an LRU-style
+eviction policy over the hash table or a way to know which keys are
+"done" before end of partition, neither of which this operator has
+during accumulation; resetting the whole table is simpler and, by
+construction, still correct, at the cost of a key being written to and
+read back from disk more than once if it is spilled multiple times over
+one partition's lifetime. `benchmarks/spilling.py` measures this cost
+directly: sort spilling was 1.83x slower than in-memory on this machine,
+grace-hash aggregate spilling was 3.16x slower, for the reason just
+described (see `docs/benchmarks.md`'s "Spilling: what does it cost?").
+The merge phase processes one bucket's distinct keys at a time (seeding
+from the still-in-memory final remainder, then folding in every spill
+file written for that bucket across every round), bounding *memory*
+during the merge to one bucket's key set, not the whole partition's; it
+does not bound *time* per bucket, so one bucket holding a
+disproportionate share of distinct keys (skew) is not mitigated here, a
+documented, deliberate gap (`benchmarks/skew.py` measures skew's effect,
+it does not fix it, since fixing it, e.g. by sub-partitioning an
+oversized bucket further, is out of this milestone's scope).
+
+**CSV byte-offset seeking replaces re-parsing every row before a
+partition's own range with two extra, cheap, `readline()`-only full-file
+passes.** Previously, every CSV partition's `records_fn` ran
+`csv.reader` from the top of the file and threw away every row before
+its own assigned range via `itertools.islice`, meaning the file's data
+section was effectively parsed `num_partitions` times per query.
+`CSVDataSource.read()` now also records one byte offset per partition
+(`_locate_partition_offsets`), so each partition seeks straight to its
+own first row instead. The obstacle: `csv.reader(f)` disables `f.tell()`
+for the rest of that file object's life (`OSError: telling position
+disabled by next() call`), discovered empirically before writing any
+implementation code, not after a mysterious failure; `f.readline()` has
+no such restriction and round-trips correctly with `f.seek()`, so offset
+recording and per-partition reads both use `readline()` plus
+`next(csv.reader([line]))` to parse one already-read line at a time,
+never a `csv.reader` iterated directly over the file. The accepted cost:
+a quoted CSV field containing a literal embedded newline is split across
+two `readline()` calls, which either misparses the row or raises
+`ValueError` (`_coerce_row`'s `zip(..., strict=True)` sees a
+line with fewer fields than the header), where the pre-Milestone-9
+`csv.reader(f)`-from-the-top approach handled it correctly (see `storage/
+csv.py`'s module docstring and `tests/unit/test_csv_byte_offset.py`'s
+`test_embedded_newline_in_quoted_field_is_a_known_limitation`, which
+documents the failure mode directly instead of leaving it as a silent
+surprise). This codebase's CSV reader was never a full RFC 4180
+implementation to begin with (see `_try_parse`'s type inference, no
+custom delimiter/quoting support); this is one more, now-documented, gap
+in that same spirit, accepted in exchange for real, measured (`tests/
+integration/test_scheduler_multiprocessing.py`'s byte-offset-under-real-
+multiprocessing test) per-row-parsed-once behavior.
 
 ## Key Milestone-8 design decisions
 
@@ -650,9 +764,9 @@ partition) before it knows that group's final state, so it builds a
 `dict` up front rather than yielding lazily like `FilterExec`/
 `ProjectExec` do. `shuffle/writer.py`, by contrast, writes one record at
 a time to whichever target file it belongs to, the only per-target state
-kept in memory is one open file handle and a running checksum. Spilling
-the aggregate's hash table to disk under memory pressure is not
-implemented (Milestone 9); the architecture note is in `docs/shuffle.md`.
+kept in memory is one open file handle and a running checksum. The
+aggregate's hash table does spill to disk under memory pressure past a
+configured threshold, see `docs/spilling.md`.
 
 **Shuffle blocks are pickled records, not JSON lines.** `Avg`'s partial
 state is a `(sum, count)` tuple (`expressions/aggregate.py`); JSON would
@@ -802,14 +916,17 @@ sources that can't honor "call the factory twice" (e.g. a network stream)
 aren't supported. Only file/in-memory sources exist so far, so this is
 free for now.
 
-**CSV reads are two-pass but bounded-memory.** `CSVDataSource.read()` scans
-the file once to infer a schema (from a sample) and count rows (to compute
-partition boundaries), retaining no row data. Each partition's factory
-re-opens the file and streams just its row range via `itertools.islice`.
-This means a file larger than RAM can be processed, at the cost of
-re-seeking past earlier rows once per partition — a production system
-would instead record byte offsets per partition to seek directly; skipped
-here as unneeded complexity for what Milestone 1 needs to demonstrate.
+**CSV reads are multi-pass but bounded-memory.** `CSVDataSource.read()`
+counts rows and infers a schema (from a capped-length sample), retaining
+no row data; it also records one byte offset per partition
+(`_locate_partition_offsets`, via `readline()`-only passes, no CSV
+tokenizing) so each partition's factory can seek straight to its own
+first row instead of re-parsing every row before it (see Key spilling
+and CSV byte-offset design decisions, above, and `storage/csv.py`'s
+module docstring for the full before/after picture and the
+`f.tell()`/`csv.reader` gotcha that
+shaped this design). This still means a file larger than RAM can be
+processed, no row is ever retained past the pass that reads it.
 
 **`repartition()` is not streaming.** `Dataset.repartition(n)` currently
 materializes every row in memory to redistribute them round-robin, because
@@ -837,11 +954,11 @@ used as dict/set keys for value equality.
 
 ## What's deliberately not here yet
 
-Per the build spec's milestone breakdown: performance optimization/
-skew/spilling (Milestone 9) and remote-worker architecture readiness
-(Milestone 10). Each has a numbered section in the build spec and lands
-in the milestone assigned to it, see `README.md`'s status section for
-the current cut line. Within what Milestone 5 does cover: `Join` only supports `how="inner"` with
+Remote-worker architecture readiness: real network communication and
+cloud deployment, not implemented until the local engine is stable, per
+the build spec. See `README.md`'s status section for the current cut
+line. Within what Milestone 5 does cover:
+`Join` only supports `how="inner"` with
 common-named `on=` columns (no left/right/full outer, no semi/anti, no
 differently-named join keys); there is no sort-merge join, only hash
 join (broadcast or shuffled); broadcast-vs-shuffle join selection is an
@@ -886,7 +1003,17 @@ never available before an action runs (by design, see "Metrics are a
 plain scheduler attribute" above); and the benchmark scripts in
 `benchmarks/` are single-trial, uncontrolled measurements on one
 development machine, not a reproducible, isolated benchmark suite (see
-`docs/benchmarks.md`'s own stated caveat). Nothing spills an in-progress
-aggregate's hash table or sort buffer to disk under memory pressure
-(Milestone 9), and shuffle output is never compressed
-(`ExecutionConfig.shuffle_compression` exists but is unread).
+`docs/benchmarks.md`'s own stated caveat). For spilling and CSV
+byte-offset seeking (see Key spilling and CSV byte-offset design
+decisions, above, and `docs/spilling.md`): grace-hash aggregate spilling
+bounds memory during
+both accumulation and the merge phase but not *time* per bucket, so a
+single hash bucket holding a disproportionate share of distinct keys
+(skew) is measured (`benchmarks/skew.py`) but not mitigated; a spill
+resets the whole in-memory table, not just the excess, so a key spilled
+and seen again is re-accumulated and reconciled later rather than
+updated in place; CSV byte-offset seeking does not handle a quoted field
+containing a literal embedded newline (misparses or raises `ValueError`,
+see `storage/csv.py`'s module docstring); and shuffle output is still
+never compressed (`ExecutionConfig.shuffle_compression` exists but is
+unread).
