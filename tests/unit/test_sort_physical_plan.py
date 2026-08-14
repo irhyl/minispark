@@ -2,11 +2,12 @@ import os
 import random
 
 from minispark.api.functions import col
+from minispark.api.functions import sum as ssum
 from minispark.core.dataset import Dataset
 from minispark.core.partition import Partition, PartitionMetadata
 from minispark.core.schema import Field, Schema
 from minispark.core.types import INT, STRING
-from minispark.logical.nodes import Scan, Sort
+from minispark.logical.nodes import Aggregate, Scan, Sort
 from minispark.physical import operators as operators_module
 from minispark.physical.operators import execute_partition
 from minispark.physical.plan import ExchangeExec, ScanExec, SortExec
@@ -66,6 +67,28 @@ def test_descending_sort_negates_the_partition_key_and_boundaries():
 def test_single_partition_fallback_for_non_numeric_key():
     scan, _ = make_scan([{"name": "b", "age": 1}, {"name": "a", "age": 2}])
     physical = plan_physical(Sort(scan, [col("name")], [True]), shuffle_partitions=4)
+    exchange = physical.child
+    assert exchange.range_boundaries is None
+    assert exchange.num_partitions == 1
+
+
+def test_single_partition_fallback_when_sort_child_is_an_aggregate():
+    """Regression test: `order_by()` on the output of `group_by().agg()`
+    (the exact shape in the build spec's own "Definition of done"
+    example) used to crash with `NotImplementedError` instead of falling
+    back to a single shuffle partition. `_sort_range_boundaries` samples
+    the sort key's range by eagerly executing the child plan via
+    `physical/operators.py`'s whole-Dataset `execute()` oracle, which
+    only has cases for Scan/Filter/Project; its old fallback conditions
+    (`shuffle_partitions <= 1`, non-numeric key) did not cover "child
+    plan contains an Aggregate/Join," so this combination reached
+    `execute()` and crashed. The sort key here (`total`, an int sum) is
+    numeric and `shuffle_partitions=4`, so a fix that only checked those
+    two conditions would still fail this test; only checking whether the
+    child plan is actually oracle-executable catches it."""
+    scan, _ = make_scan([{"name": "a", "age": 1}, {"name": "b", "age": 2}])
+    agg = Aggregate(scan, [col("name")], [ssum("age").alias("total")])
+    physical = plan_physical(Sort(agg, [col("total")], [True]), shuffle_partitions=4)
     exchange = physical.child
     assert exchange.range_boundaries is None
     assert exchange.num_partitions == 1
