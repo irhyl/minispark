@@ -18,6 +18,17 @@ from minispark.core.schema import Schema
 from minispark.expressions.base import Expression
 from minispark.logical.nodes import output_name
 
+# Default `spill_threshold_bytes` for a hand-built `HashAggregateExec`/
+# `SortExec` that does not explicitly opt into spilling (every node built
+# by `physical/planner.py`'s `plan_physical()` always does, using
+# `MemoryConfig.spill_threshold_bytes`; see docs/spilling.md). Not
+# derived from `MemoryConfig`'s own default: `physical/` does not import
+# `config/` (see docs/architecture.md's package layout notes on keeping
+# config extraction in the `api/` layer), so this is deliberately just
+# "large enough to never trigger in practice," not a mirror of any
+# specific configured number that could silently drift out of sync.
+NEVER_SPILL = 2**62
+
 
 class PhysicalPlan(ABC):
     @property
@@ -112,12 +123,18 @@ class HashAggregateExec(PhysicalPlan):
         aggregates: list[Expression],
         schema: Schema,
         is_partial: bool,
+        spill_threshold_bytes: int = NEVER_SPILL,
     ):
         self.child = child
         self.group_by = group_by
         self.aggregates = aggregates
         self._schema = schema
         self.is_partial = is_partial
+        # Milestone 9: when the in-memory `groups` hash table's estimated
+        # size (physical/operators.py's own sys.getsizeof-based heuristic)
+        # crosses this many bytes, it spills to local disk instead of
+        # growing further. See docs/spilling.md for the grace-hash design.
+        self.spill_threshold_bytes = spill_threshold_bytes
 
     @property
     def schema(self) -> Schema:
@@ -325,11 +342,19 @@ class SortExec(PhysicalPlan):
         sort_exprs: list[Expression],
         ascending: list[bool],
         schema: Schema,
+        spill_threshold_bytes: int = NEVER_SPILL,
     ):
         self.child = child
         self.sort_exprs = sort_exprs
         self.ascending = ascending
         self._schema = schema
+        # Milestone 9: when the in-memory row buffer's estimated size
+        # crosses this many bytes, the buffer is sorted, spilled to local
+        # disk as one run, and cleared, rather than growing further; every
+        # spilled run (plus whatever remains in memory) is merged back
+        # together at the end. See docs/spilling.md for the external
+        # merge sort design.
+        self.spill_threshold_bytes = spill_threshold_bytes
 
     @property
     def schema(self) -> Schema:
