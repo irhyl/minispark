@@ -36,7 +36,14 @@ class ShuffleManager:
         self._blocks: dict[int, list[ShuffleBlockMeta]] = {}
 
     def register_blocks(self, stage_id: int, blocks: list[ShuffleBlockMeta]) -> None:
-        self._blocks.setdefault(stage_id, []).extend(blocks)
+        """Overwrite, not append: a stage is normally registered exactly
+        once, but lineage-based recomputation (execution/scheduler.py) can
+        re-run a whole stage and call this a second time for the same
+        stage_id, and its fresh blocks must fully replace the stale ones,
+        not sit alongside them (the old block files that recomputation was
+        triggered by are gone or corrupt; keeping their metadata around
+        would let a later reader pick them again)."""
+        self._blocks[stage_id] = list(blocks)
 
     def blocks_for(self, stage_id: int, target_partition: int) -> list[ShuffleBlockMeta]:
         return [
