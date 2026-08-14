@@ -75,10 +75,15 @@ class TaskMetrics:
     input_records: int | None = None
     output_records: int = 0
     output_bytes: int = 0
-    # Not implemented: would need either byte-offset tracking in the
-    # storage layer (input_bytes) or the `psutil` optional dependency
-    # (cpu_time_seconds, peak_memory_bytes), neither of which exists yet.
+    # input_bytes: not implemented, would need byte-offset tracking in
+    # the storage layer.
     input_bytes: int | None = None
+    # cpu_time_seconds/peak_memory_bytes: filled in by execution/worker.py
+    # via the optional `psutil` dependency (Milestone 8), None if psutil
+    # is not installed. peak_memory_bytes is this process's RSS at task
+    # completion, not a true peak (would need continuous sampling from a
+    # concurrently running background thread, not implemented); see
+    # worker.py's module docstring.
     cpu_time_seconds: float | None = None
     peak_memory_bytes: int | None = None
     # 0 for a task with no shuffle input or output. For a shuffle-write
