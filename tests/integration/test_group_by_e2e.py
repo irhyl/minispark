@@ -9,6 +9,7 @@ the build spec's "MiniSpark result == reference result" testing rule.
 from __future__ import annotations
 
 import collections
+import random
 
 import pytest
 
@@ -17,11 +18,25 @@ from minispark.api.functions import max as mmax
 from minispark.api.functions import min as mmin
 from minispark.api.functions import sum as ssum
 from minispark.api.session import MiniSparkSession
+from minispark.config.config import Config, EngineConfig, MemoryConfig
 from minispark.logical.analyzer import AnalysisException
 
 
 def make_session(master: str = "local[1]"):
     return MiniSparkSession.builder.master(master).app_name("group_by_test").get_or_create()
+
+
+def make_spilling_session(master: str = "local[3]"):
+    """A session whose HashAggregateExec nodes spill almost immediately
+    (spill_threshold_bytes ~524, see MemoryConfig.spill_threshold_bytes),
+    for a test that proves the grace-hash spill/merge path
+    (physical/operators.py's `_execute_hash_aggregate_partition`) is
+    correct when it runs for real, across real OS worker processes."""
+    config = Config(
+        engine=EngineConfig(master=master),
+        memory=MemoryConfig(execution_limit_mb=1, spill_threshold=0.0005),
+    )
+    return MiniSparkSession(config=config, app_name="group_by_spill_test")
 
 
 def _reference_group_by(records, key_fn):
@@ -106,6 +121,35 @@ def test_group_by_real_multiprocessing_matches_reference():
     for country, group_rows in reference.items():
         assert rows[country]["n"] == len(group_rows)
         assert rows[country]["total"] == sum(r["revenue"] for r in group_rows)
+
+
+def test_group_by_with_real_spilling_and_real_multiprocessing_matches_reference():
+    """Forces both the partial and final HashAggregateExec stages to
+    actually spill to disk (small spill_threshold_bytes) inside real
+    worker processes (local[3]), and checks the result against a plain
+    Python reference computed independently of MiniSpark, not just
+    against a non-spilling MiniSpark run."""
+    random.seed(29)
+    countries = ["US", "CA", "UK", "DE", "FR", "JP"]
+    records = [
+        {"country": random.choice(countries), "revenue": random.randint(1, 100)}
+        for _ in range(90)
+    ]
+    session = make_spilling_session("local[3]")
+    df = session.create_dataframe(records, num_partitions=5)
+    result = df.group_by("country").agg(
+        count("*").alias("n"), ssum("revenue").alias("total"), avg("revenue").alias("avg_rev")
+    )
+    rows = {r["country"]: r for r in result.collect()}
+
+    reference = _reference_group_by(records, key_fn=lambda r: r["country"])
+    assert set(rows.keys()) == set(reference.keys())
+    for country, group_rows in reference.items():
+        assert rows[country]["n"] == len(group_rows)
+        assert rows[country]["total"] == sum(r["revenue"] for r in group_rows)
+        assert rows[country]["avg_rev"] == pytest.approx(
+            sum(r["revenue"] for r in group_rows) / len(group_rows)
+        )
 
 
 def test_group_by_on_csv_source(tmp_path):
