@@ -5,10 +5,11 @@ understand, not to replace, systems like Apache Spark.
 
 MiniSpark is a research/educational project. It is not production-ready, not a
 Spark replacement, and no performance claim in this repository is made without
-an accompanying, reproducible benchmark (see `docs/benchmarks.md`, added once
-there is something real to measure).
+an accompanying, actually-run benchmark (see `docs/benchmarks.md`; every
+number there was measured on a real machine, not invented, including results
+that do not flatter the design).
 
-## Status: Milestone 7
+## Status: Milestone 8
 
 Implemented so far:
 
@@ -81,6 +82,22 @@ Implemented so far:
   DataFrame whose plan is a fresh scan over the durably-materialized
   result, cutting the original plan's lineage at that point. `write`
   returns a `DataFrameWriter` (`df.write.parquet(path)`), also eager.
+  `last_run_metrics` exposes the most recently collected `QueryMetrics`
+  after an action runs (`None` before that): per-stage task counts,
+  wall-clock time, rows, bytes, shuffle bytes, retries, and, if `psutil`
+  is installed, CPU time and peak memory.
+- **SQL** (`minispark/sql/`): `session.sql("SELECT ...")` parses SQL text
+  (hand-written tokenizer + recursive-descent parser, no grammar
+  library) directly into the same logical plan nodes the DataFrame API
+  builds, no separate execution path. Supports one `SELECT` statement's
+  worth of grammar: `FROM` a registered temp view
+  (`session.create_or_replace_temp_view(name, df)`), one inner `JOIN
+  ... ON` (same-named column on both sides only, matching `Join`'s own
+  scope), `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, comparisons, boolean
+  connectives, arithmetic, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`. No
+  subqueries, `UNION`, window functions, `LIMIT`, CTEs, or UDFs: SQL is a
+  translator into existing capability, not a way to add new capability
+  without also extending the DataFrame API and logical plan.
 - **DAG, stages, and tasks** (`minispark/execution/dag.py`,
   `stages.py`, `tasks.py`): classifies every physical node's dependency
   as narrow or wide (a shuffle `Exchange` is the one wide node), splits a
@@ -109,10 +126,11 @@ Implemented so far:
 
 Not implemented yet (by design, not oversight): left/right/full outer or
 semi/anti joins, differently-named join keys, sort-merge join,
-cost-based join strategy selection, SQL, and benchmarking. Every one of
-those has a numbered section in the build spec this project follows and
-lands in its own milestone (or, for the join-scope items, is an explicit,
-documented simplification of Milestone 5's own scope, see
+cost-based join strategy selection, and performance optimization/skew/
+spilling and remote-worker architecture readiness (Milestones 9 and 10).
+Every one of those has a numbered section in the build spec this project
+follows and lands in its own milestone (or, for the join-scope items, is
+an explicit, documented simplification of Milestone 5's own scope, see
 `logical/nodes.py`'s `Join` docstring). Within what Milestone 6 does
 cover: lineage-based recomputation is stage-granular (a lost partition is
 recovered by recomputing its entire upstream stage, not just the
@@ -127,7 +145,14 @@ comparisons/`And`/`Or`/`Not`/null-checks, no arithmetic; only
 bool/int/float/str/null round-trip through Parquet, no date/timestamp/
 decimal/nested types; row-group-to-partition assignment is contiguous
 chunking, not size-aware balancing; and `write.parquet()` has no
-target-file-size control or small-file coalescing.
+target-file-size control or small-file coalescing. Within what
+Milestone 8 does cover (see `docs/sql.md` and `docs/benchmarks.md`): SQL
+has no subqueries/`UNION`/window functions/`LIMIT`/CTEs/UDFs, and a
+`JOIN ... ON` clause must compare a same-named column on both sides;
+`peak_memory_bytes` is a task's RSS at completion, not a continuously
+sampled true peak; and the benchmark scripts in `benchmarks/` are
+single-trial, uncontrolled measurements on one development machine, not
+a reproducible, isolated benchmark suite.
 
 ## Quick start
 
@@ -138,10 +163,16 @@ python examples/basic_dataframe.py
 python examples/aggregations.py
 python examples/joins.py
 python examples/checkpointing.py
+python examples/sql.py
 
 # Parquet support needs the optional columnar extra:
 pip install -e ".[columnar]"
 python examples/parquet.py
+
+# Benchmarks (see docs/benchmarks.md for recorded numbers and caveats):
+python -m benchmarks.scaling
+python -m benchmarks.join_strategy
+python -m benchmarks.csv_vs_parquet   # needs the columnar extra above
 ```
 
 ```python
@@ -164,16 +195,20 @@ result.show()
 ## Architecture
 
 See `docs/architecture.md` for the layered design and why each layer
-exists, `docs/query-planning.md` for how a DataFrame call gets from a
-logical plan to a physical plan (analyzer, optimizer, physical plan,
-including the scan-pushdown pass), `docs/execution-model.md` for how
-that physical plan actually runs (DAG, stages, tasks, the local
-scheduler, what `local[N]` really does, and how lineage-based
-recomputation and checkpointing work), `docs/shuffle.md` for exactly
-what happens at a shuffle boundary (partial aggregation, hash
-partitioning, the on-disk block format shared by shuffle blocks and
-checkpoints), and `docs/columnar-storage.md` for Parquet reading/
-writing, real column pruning, and real predicate pushdown.
+exists, `docs/query-planning.md` for how a DataFrame call (or a SQL
+query, see below) gets from a logical plan to a physical plan (analyzer,
+optimizer, physical plan, including the scan-pushdown pass),
+`docs/execution-model.md` for how that physical plan actually runs (DAG,
+stages, tasks, the local scheduler, what `local[N]` really does,
+lineage-based recomputation and checkpointing, and how query metrics are
+collected), `docs/shuffle.md` for exactly what happens at a shuffle
+boundary (partial aggregation, hash partitioning, the on-disk block
+format shared by shuffle blocks and checkpoints), `docs/columnar-storage.md`
+for Parquet reading/writing, real column pruning, and real predicate
+pushdown, `docs/sql.md` for exactly what SQL is and is not supported and
+why, and `docs/benchmarks.md` for real, actually-measured numbers (and
+their caveats) on `local[N]` scaling, CSV vs. Parquet, and broadcast vs.
+shuffle joins.
 
 ## Development
 
