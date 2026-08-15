@@ -137,7 +137,6 @@ python -m benchmarks.spilling         # the wall-clock cost of spilling to disk
 
 | Doc | Covers |
 |---|---|
-| `docs/build-spec.md` | The governing spec: objective, layering, technology constraints, milestones |
 | `docs/architecture.md` | Package-by-package layering and the reasoning behind each design choice |
 | `docs/query-planning.md` | Logical plan, analyzer, optimizer, physical plan |
 | `docs/execution-model.md` | DAG, stages, tasks, the local scheduler, lineage recovery, checkpointing, metrics |
