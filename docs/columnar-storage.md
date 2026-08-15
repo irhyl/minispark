@@ -1,8 +1,9 @@
 # Columnar Storage
 
-How Parquet reading/writing and scan pushdown work, as of Milestone 7.
-See `docs/architecture.md`'s Key Milestone-7 design decisions for the
-reasoning behind the choices below; this document is the "what actually
+How Parquet reading/writing and scan pushdown work.
+See `docs/architecture.md`'s "Columnar storage (Parquet)" design
+decisions for the reasoning behind the choices below; this document is
+the "what actually
 happens" companion, the way `docs/shuffle.md` is for shuffle and
 `docs/execution-model.md` is for the DAG/Stage/Task machinery.
 
@@ -10,8 +11,8 @@ happens" companion, the way `docs/shuffle.md` is for shuffle and
 
 Every physical operator (`ScanExec`, `FilterExec`, `ProjectExec`,
 `HashAggregateExec`, `HashJoinExec`, `SortExec`) still operates on
-`Record = dict[str, Any]`, one row at a time, exactly as every earlier
-milestone left it. What is genuinely new and genuinely columnar is
+`Record = dict[str, Any]`, one row at a time. What is genuinely new and
+genuinely columnar is
 confined to `storage/parquet.py`: pyarrow reads a Parquet file with real
 column pruning (an unrequested column's data pages are never decoded)
 and real, row-group-level predicate pushdown (a row group whose own
@@ -93,7 +94,7 @@ Translation rules, and why each one is the way it is:
 * **Arithmetic** (`Add`/`Subtract`/`Multiply`/`Divide`) inside a
   predicate is never translated: pushing `(a + b) > 5` down is possible
   in principle via `pyarrow.compute` but is not implemented, out of
-  scope for what this milestone needs to demonstrate. A predicate
+  scope here. A predicate
   containing arithmetic simply is not pushed (or, inside an `And`, just
   that conjunct is not pushed); it is still evaluated correctly by the
   row-level Filter.
@@ -104,8 +105,8 @@ literal) makes pyarrow's pushed filter exclude that row, silently. The
 row-based engine, reached without pushdown (e.g. a CSV source, which
 never pushes filters), would instead raise `TypeError` evaluating the
 same comparison (`None > 18` is not orderable in Python), a
-pre-existing limitation of row-at-a-time expression evaluation that
-predates this milestone, not something Parquet pushdown introduces.
+pre-existing limitation of row-at-a-time expression evaluation, not
+something Parquet pushdown introduces.
 Fixing it would mean giving every comparison operator real, general
 null-handling semantics, a broader change than "predicate pushdown"
 needs; documented here rather than silently left for someone to
@@ -122,7 +123,7 @@ honors `columns` is never asked to drop something a `FilterExec`/
 ## The scan-pushdown pass (why this belongs to `physical/planner.py`, not the optimizer)
 
 `optimizer/rules.py`'s `ProjectionPruning` and `PredicatePushdown`
-(Milestone 2) already compute, at the *logical plan shape* level and
+already compute, at the *logical plan shape* level and
 without touching data, which columns are needed and how far a filter can
 safely move toward a `Scan`. What they cannot do is act on that
 information: a rule is held to "never touch data," and re-reading a
@@ -181,15 +182,15 @@ docstring).
 
 ## `ScanSource`: how `Scan` reaches a `DataSource` without `logical/` importing `storage/`
 
-Before this milestone, `Scan` held only an already-`.read()` `Dataset`:
-the actual read happened once, eagerly, at DataFrame-construction time
-(`session.read.csv(path)` calls `.read()` immediately), long before the
-optimizer has computed anything pushdown could use. Making pushdown real
-needs `Scan` to be able to trigger a *second*, better-informed read once
-those hints are known. But `logical/` has never imported `storage/` (a
+Without pushdown, `Scan` would hold only an already-`.read()` `Dataset`:
+the actual read would happen once, eagerly, at DataFrame-construction
+time (`session.read.csv(path)` calls `.read()` immediately), long before
+the optimizer has computed anything pushdown could use. Making pushdown
+real needs `Scan` to be able to trigger a *second*, better-informed read
+once those hints are known. But `logical/` never imports `storage/` (a
 deliberate boundary: the logical-plan layer only knows the data model a
-source produces, not the storage layer's I/O code), and this milestone
-does not change that.
+source produces, not the storage layer's I/O code), and pushdown does
+not change that.
 
 The fix is a structural `Protocol`, defined in `logical/nodes.py` itself:
 
@@ -201,8 +202,8 @@ class ScanSource(Protocol):
 `storage.datasource.DataSource` satisfies this purely by having a
 matching `read` method, no inheritance, no registration, and no import
 from `logical/` to `storage/` anywhere. `Scan.source: ScanSource | None`
-defaults to `None`: a hand-built `Scan(dataset, name)`, exactly as every
-test before this milestone already constructs one, keeps working
+defaults to `None`: a hand-built `Scan(dataset, name)`, exactly the way
+tests that predate pushdown already construct one, keeps working
 unchanged, and pushdown simply never applies to it.
 
 ## Writing
