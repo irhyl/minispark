@@ -1,11 +1,11 @@
 # Query Planning
 
-How a `DataFrame` call becomes rows, as of Milestone 8. As of this
-milestone there are two ways to build the logical plan this document
-covers, `DataFrame` API chaining, and `session.sql(...)` (`sql/parser.py`,
-see `docs/sql.md`), which parses SQL text into exactly the same logical
-plan nodes rather than getting its own execution path, per the build
-spec's "there must not be a separate SQL execution engine" rule.
+How a `DataFrame` call becomes rows. There are two ways to build the
+logical plan this document covers: `DataFrame` API chaining, and
+`session.sql(...)` (`sql/parser.py`, see `docs/sql.md`), which parses
+SQL text into exactly the same logical plan nodes rather than getting
+its own execution path (there must not be a separate SQL execution
+engine).
 Everything below this point (analysis, optimization, physical planning,
 scan pushdown, stage splitting, scheduled execution) applies identically
 regardless of which path built the plan.
@@ -63,7 +63,7 @@ than inner (left/right/full outer, semi/anti are not implemented, see
 `Optimizer.optimize()` runs a fixed list of rules over the analyzed plan,
 repeating the whole list until a pass produces no change (compared by
 `explain_string()` text, capped at 10 iterations: see
-`docs/architecture.md`'s Milestone-2 design decisions for why text
+`docs/architecture.md`'s "Optimizer" design decisions for why text
 comparison instead of `==`). The default rules, in order:
 
 1. **ConstantFolding**: evaluates sub-expressions made entirely of
@@ -83,11 +83,11 @@ comparison instead of `==`). The default rules, in order:
    determine what they need from their child(ren) (like `Project` does),
    so `needed` is replaced, not merged, at those nodes; `Sort` behaves
    like `Filter` (adds its sort keys to whatever was already needed).
-   Through Milestone 6 this only narrowed plan *shape* (smaller Record
-   dicts flowing through Filter/Project below `Scan`), not bytes read
-   from disk; Milestone 7's physical-planning-time scan-pushdown pass
-   (below) is what turns this rule's already-computed column set into an
-   actual, narrower read for a source that can honor it.
+   On its own this only narrows plan *shape* (smaller Record dicts
+   flowing through Filter/Project below `Scan`), not bytes read from
+   disk; the physical-planning-time scan-pushdown pass (below) is what
+   turns this rule's already-computed column set into an actual,
+   narrower read for a source that can honor it.
 5. **RedundantProjectionElimination**: removes a `Project` that turned
    out to be a no-op (its columns exactly match its child's schema), and
    collapses a plain-column `Project` sitting directly below another one.
@@ -118,9 +118,9 @@ node per logical node, because each has exactly one execution strategy.
 `Sort`'s.
 
 `physical/operators.py`'s `execute()` (whole-Dataset, single-process) is
-what Milestone 1-2 used directly; as of Milestone 3 it is an oracle only,
-used in tests to check that later, more complex execution paths agree
-with it. The real path is `execute_partition()` (one partition at a time)
+kept as an oracle only, used in tests to check that later, more complex
+execution paths agree with it. The real path is `execute_partition()`
+(one partition at a time)
 run by `execution/scheduler.py`'s `LocalScheduler`, across a real
 `ProcessPoolExecutor` when `local[N]` has `N > 1`: see
 `docs/execution-model.md` for the DAG/Stage/Task/Worker picture that sits
@@ -139,8 +139,8 @@ only a Scan/Filter/Project child chain is supported, not one ending in
 `optimizer/statistics.py`'s `compute_statistics()`, right there in the
 planner.
 
-The second, added in Milestone 7: `_pushdown_scan_reads()` runs once,
-before any node translation, and re-reads any `Scan` whose `source` is
+The second: `_pushdown_scan_reads()` runs once, before any node
+translation, and re-reads any `Scan` whose `source` is
 set (see `logical/nodes.py`'s `ScanSource` Protocol) with the columns/
 filter its surrounding Project/Filter chain implies, so a source that
 can honor them (Parquet: real column pruning and row-group-level
@@ -155,25 +155,25 @@ everything else in this file.
 ## `explain()`
 
 `df.explain()` (the default) prints only `"== Logical Plan =="`, the raw,
-unanalyzed plan, matching Milestone 1's behavior exactly.
+unanalyzed plan.
 `df.explain(optimized=True)` prints four sections: `"== Analyzed Logical
 Plan =="`, `"== Optimized Logical Plan =="`, `"== Physical Plan =="`, and
 `"== Stages =="` (one subsection per stage, from
 `execution/stages.py`'s `build_stages()`), so the effect of each step,
 including how many stages a shuffle-heavy query actually splits into, is
-visible. See `examples/basic_dataframe.py` for a Milestone 1/2 example
+visible. See `examples/basic_dataframe.py` for a simple example
 (constant folding, pushdown, and pruning all fire on one small query),
-`examples/aggregations.py` / `examples/joins.py` for Milestone 4/5
+`examples/aggregations.py` / `examples/joins.py` for
 examples that produce real multi-stage, multi-shuffle plans, and
-`examples/parquet.py` for a Milestone 7 example where the "Physical
+`examples/parquet.py` for an example where the "Physical
 Plan" section's `ScanExec` visibly reads fewer columns than the source
 file has, the scan-pushdown pass's effect made directly visible (the
 "Optimized Logical Plan" section above it does not show this: pushdown
 happens at physical-planning time, one step later, see this document's
-"Physical planning and execution" section), and `examples/sql.py` for a
-Milestone 8 example proving a SQL-built `DataFrame` explains exactly
+"Physical planning and execution" section), and `examples/sql.py` for an
+example proving a SQL-built `DataFrame` explains exactly
 like any other, join, group by, having, and order by all included in
-one query. `explain()` never executes anything, before or after
-Milestone 8: `DataFrame.last_run_metrics` (see docs/execution-model.md's
+one query. `explain()` never executes anything:
+`DataFrame.last_run_metrics` (see docs/execution-model.md's
 "Metrics and profiling") is the separate, only-after-an-action-actually-
 runs mechanism for seeing what a query *did*, not what it *would* do.
