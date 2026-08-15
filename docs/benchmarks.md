@@ -7,10 +7,9 @@ isolated benchmark rig: no dedicated hardware, no repeated-and-averaged
 trials, no other processes quiesced. Where a run was repeated and the
 numbers moved meaningfully between runs, that variance is reported too,
 not hidden behind a single cherry-picked number. Per this project's own
-rule (`CLAUDE.md`, the build spec's "Non-negotiables"): never fabricate a
-benchmark value, and if something cannot be measured here, say
-"NOT RUN (hardware limitation)" rather than invent a number. Everything
-below *was* run; nothing here is invented.
+rule: never fabricate a benchmark value, and if something cannot be
+measured here, say "NOT RUN (hardware limitation)" rather than invent a
+number. Everything below *was* run; nothing here is invented.
 
 ## Environment
 
@@ -72,8 +71,8 @@ should be read as "roughly this order of magnitude, on this machine,
 this run," not a precise, reproducible measurement.
 
 **What this does and does not show.** It does not show that `local[N]`
-is pointless: Milestone 3's own tests (`tests/integration/
-test_scheduler_multiprocessing.py`) already prove real OS processes are
+is pointless: `tests/integration/
+test_scheduler_multiprocessing.py` already proves real OS processes are
 genuinely used, and a CPU-bound workload with enough data per partition
 to amortize task overhead would very plausibly look different. It does
 show, honestly, that "more workers" is not a free win at these sizes on
@@ -179,18 +178,18 @@ effect (skew) when the two are combined at a small-enough task size.
 
 **Why the multiplier is modest (1.77x, not close to the 0.85 / 0.15 ≈
 5.7x row-count skew).** The reduce stage does not process raw rows: by
-the time data reaches it, Milestone 4's map-side partial aggregation has
-already collapsed each source partition's rows into one partial count
-per (partition, key) pair, per `physical/operators.py`'s
+the time data reaches it, map-side partial aggregation has already
+collapsed each source partition's rows into one partial count per
+(partition, key) pair, per `physical/operators.py`'s
 `_execute_hash_aggregate_partition`. What the skewed reduce task
 actually does more of is merge more partial states and finalize more
 result rows for its one dominant key, not iterate 5.7x more raw rows;
 the row-count skew is real, but partial aggregation absorbs most of its
 cost before the reduce side ever sees it. This is expected, not a
 measurement error, and is itself worth knowing: it means partial
-aggregation (already implemented since Milestone 4) is doing real,
-unplanned-for-this-benchmark work reducing skew's impact, on top of its
-original purpose of shrinking shuffle volume.
+aggregation is doing real, unplanned-for-this-benchmark work reducing
+skew's impact, on top of its original purpose of shrinking shuffle
+volume.
 
 ## Spilling: what does it cost?
 
@@ -199,8 +198,8 @@ original purpose of shrinking shuffle volume.
 queries, each run twice under `local[1]` (isolating spilling's own cost
 from the `ProcessPoolExecutor` overhead measured elsewhere on this page):
 once with the default `MemoryConfig` (`spill_threshold_bytes` ~= 3.4 GB,
-effectively never crossed at this data size, so this is the pre-
-Milestone-9 in-memory-only behavior) and once with `spill_threshold_bytes`
+effectively never crossed at this data size, so this is the plain
+in-memory behavior) and once with `spill_threshold_bytes`
 forced down to ~5.2 MB, small enough to force many real spill rounds
 (`physical/operators.py`'s external-merge-sort for `order_by`, grace-hash
 spill/merge for `group_by`).
@@ -254,14 +253,14 @@ exactly what `-m` gives (see `benchmarks/__init__.py`'s docstring).
 
 ## What this is not
 
-Not a substitute for profiling a specific, real workload: these three
-scripts each isolate one design decision (worker count, storage format,
-join strategy) on synthetic data shaped to make that one effect visible,
-not a representative "typical query." Not a comparison against Apache
-Spark, DuckDB, or pandas: the build spec explicitly scopes benchmarking
-to measuring *this* engine's own behavior, not claiming parity or
-superiority against a real distributed engine (`docs/architecture.md`'s
-opening line: "not a Spark replacement"). Not run on multiple machines
+Not a substitute for profiling a specific, real workload: each script
+isolates one design decision (worker count, storage format, join
+strategy, data skew, spilling) on synthetic data shaped to make that one
+effect visible, not a representative "typical query." Not a comparison
+against Apache Spark, DuckDB, or pandas: benchmarking here is scoped to
+measuring *this* engine's own behavior, not claiming parity or
+superiority against a real distributed engine (this project is not a
+Spark replacement). Not run on multiple machines
 or operating systems: every number above reflects this one Windows
 development machine, and, per the "local[1] vs local[N]" section above,
 would very plausibly look different on Linux (`fork` instead of
