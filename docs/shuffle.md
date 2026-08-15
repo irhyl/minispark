@@ -1,7 +1,7 @@
 # Shuffle
 
 How `group_by(...).agg(...)`, `join(...)`, and `order_by(...)` move data
-between partitions, as of Milestone 6. See `docs/execution-model.md` for
+between partitions. See `docs/execution-model.md` for
 narrow vs wide dependencies and how a wide dependency becomes a stage
 boundary in general; this document is specifically about what happens at
 that boundary, and how the three operators above differ in what they
@@ -48,10 +48,9 @@ splitting one group's rows across two target partitions. A stable hash
 `tests/unit/test_partitioner.py` by literally spawning a second Python
 process and checking it computes the same answer.
 
-`RangePartitioner` (unused as of Milestone 4) is what `order_by()` uses
-as of Milestone 5: see "Sort: range partitioning" below for how its
-boundaries are chosen and why negation, not a different partitioner,
-is what makes a descending sort work.
+`RangePartitioner` is what `order_by()` uses: see "Sort: range
+partitioning" below for how its boundaries are chosen and why negation,
+not a different partitioner, is what makes a descending sort work.
 
 ## Join: two shuffles in, one join stage out
 
@@ -185,11 +184,11 @@ at the same point. `physical/operators.py`'s `_execute_shuffle_read_partition`
 catches both and re-raises them as one `MissingShuffleDataError`
 (`shuffle/reader.py`), naming which stage and target partition could not
 be read: see `docs/execution-model.md`'s "Lineage-based recomputation"
-(Milestone 6) for what the scheduler does with that, recompute the stage
-that produced the missing data, not just retry the read that failed.
+for what the scheduler does with that, recompute the stage that produced
+the missing data, not just retry the read that failed.
 
-`storage/checkpoint.py`'s checkpoint files (`DataFrame.checkpoint()`,
-also Milestone 6) reuse this exact same back-to-back-pickle format, one
+`storage/checkpoint.py`'s checkpoint files (`DataFrame.checkpoint()`)
+reuse this exact same back-to-back-pickle format, one
 file per partition, for the same reason: it is a durable, exact,
 type-preserving way to persist a sequence of Records and read them back,
 and that need is identical whether the records are one target
@@ -209,7 +208,7 @@ deserializes from that buffer: memory is bounded by one block's size, not
 by the whole target partition's or the whole dataset's size. This is not
 a fully streaming reader for a single very large block; a production
 system would checksum framed chunks instead of whole blocks to stream a
-multi-GB block, unneeded complexity for what this milestone needs to
+multi-GB block, unneeded complexity for what this design needs to
 demonstrate.
 
 ## Driver-side bookkeeping
@@ -230,8 +229,8 @@ per upstream stage it reads from), not a reference to a live
 registered for that `stage_id`, rather than accumulating; a stage is
 still only ever registered once from its own normal run (with every one
 of that stage's tasks' blocks combined into a single call). The reason
-it needs to be overwrite, not append, is Milestone 6's lineage-based
-recomputation (`docs/execution-model.md`): recomputing a stage whose
+it needs to be overwrite, not append, is lineage-based recomputation
+(`docs/execution-model.md`): recomputing a stage whose
 blocks were found missing calls `register_blocks` a second time for the
 same `stage_id`, with the fresh blocks it just produced, and those must
 fully replace the stale metadata (pointing at files that are gone or
