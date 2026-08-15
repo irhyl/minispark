@@ -1,13 +1,13 @@
 # SQL
 
-How `session.sql(...)` works, as of Milestone 8. See `minispark.sql.
+How `session.sql(...)` works. See `minispark.sql.
 parser`'s module docstring for the exact grammar; this document is the
 "why," not a grammar reference.
 
 ## No separate SQL execution engine
 
-The build spec is explicit: "there must not be a separate SQL execution
-engine." `sql/parser.py`'s `parse_sql()` does not interpret SQL itself;
+The rule this design follows: there must not be a separate SQL execution
+engine. `sql/parser.py`'s `parse_sql()` does not interpret SQL itself;
 it translates SQL text into exactly the same `LogicalPlan` nodes
 (`Scan`, `Filter`, `Project`, `Aggregate`, `Join`, `Sort`) and
 expressions the DataFrame API builds by chaining `.filter()`/`.select()`/
@@ -22,7 +22,7 @@ directly, by comparing `explain_string()` output between a SQL-built and
 an API-built `DataFrame` for the equivalent query, not just comparing
 final rows.
 
-One consequence: a SQL query gets Milestone 7's real scan pushdown
+One consequence: a SQL query gets the engine's real scan pushdown
 (column pruning, and for Parquet, row-group-level predicate pushdown)
 for free, with no SQL-specific code needed for it. The scan-pushdown
 pass runs in `physical/planner.py`, downstream of where SQL parsing
@@ -31,8 +31,8 @@ SQL or from `.filter().select()`, and does not need to.
 
 ## Why a hand-written parser
 
-The build spec's allowed-dependencies line explicitly permits "a
-lightweight parser if needed for SQL." `sql/tokenizer.py` and `sql/
+A lightweight, hand-written parser is an explicitly allowed dependency
+choice for SQL support. `sql/tokenizer.py` and `sql/
 parser.py` are both hand-written: a tokenizer (character stream ->
 `Token`s) and a recursive-descent parser with precedence climbing for
 expressions (`sql/parser.py`'s module docstring spells out the full
