@@ -33,8 +33,8 @@ same "derived from other fields, not itself independently settable"
 pattern `EngineConfig.num_workers` already uses for `master`. The default
 (`execution_limit_mb=4096`, `spill_threshold=0.8`) is roughly 3.3 GB, in
 practice never crossed by the query sizes this project's own test suite
-and benchmarks use, matching the pre-Milestone-9 behavior exactly unless
-a caller deliberately configures a smaller `MemoryConfig`.
+and benchmarks use, matching plain in-memory behavior exactly unless a
+caller deliberately configures a smaller `MemoryConfig`.
 
 `api/dataframe.py` reads `session.config.memory.spill_threshold_bytes`
 and passes it into `physical/planner.py`'s `plan_physical()` as a plain
@@ -42,9 +42,9 @@ and passes it into `physical/planner.py`'s `plan_physical()` as a plain
 builds (the same threading pattern already used for
 `shuffle_partitions`). `physical/` still never imports `config/`: a node
 built directly in a test, without passing `spill_threshold_bytes`,
-defaults to `NEVER_SPILL` (`physical/plan.py`, `2**62`), so every
-pre-Milestone-9 test and call site keeps its exact old behavior with no
-code changes.
+defaults to `NEVER_SPILL` (`physical/plan.py`, `2**62`), so every test
+and call site that does not configure a threshold keeps its exact
+never-spills behavior with no code changes.
 
 Both operators estimate buffer size with the same heuristic already used
 elsewhere in this codebase (`output_bytes`/`optimizer/statistics.py`'s
@@ -61,11 +61,11 @@ would be under-counted. Documented at each call site, not hidden.
 record)` pairs (`seq` from a per-partition `itertools.count()`, explained
 below) and their running estimated byte size. When that size crosses
 `spill_threshold_bytes`, the buffer is sorted (`_sort_rows`, the existing
-repeated-stable-sort-passes technique, last key first, unchanged since
-Milestone 5) and written to a spill file (`physical/spill.py`, pickled
-records) as one already-sorted run, then cleared. If the partition never
-crosses the threshold, this is byte-for-byte the pre-Milestone-9
-behavior: sort the one in-memory list, return it eagerly. If it does
+repeated-stable-sort-passes technique, last key first) and written to a
+spill file (`physical/spill.py`, pickled records) as one already-sorted
+run, then cleared. If the partition never crosses the threshold, this is
+byte-for-byte the plain, non-spilling behavior: sort the one in-memory
+list, return it eagerly. If it does
 spill at least once, the final remaining buffer is sorted as one more
 run, and every run (every spill file plus the final in-memory one) is
 merged lazily with `heapq.merge()`, streamed out through the returned
@@ -85,10 +85,9 @@ elements from *different* input runs by each run's position in the
 merge, not by anything about the records, so two tied rows split across
 different spill chunks could come out in a different relative order than
 a single, non-spilling stable sort of the identical data would produce.
-This is exactly the kind of bug the build spec's correctness-first
-framing warns about: an internal, invisible-to-the-plan performance knob
-(whether spilling happened to trigger) silently changing an observable
-query result.
+This is exactly the kind of bug that matters most to catch: an internal,
+invisible-to-the-plan performance knob (whether spilling happened to
+trigger) silently changing an observable query result.
 
 The fix: every record is tagged with a strictly increasing `seq` the
 moment it is first read from the child operator, carried through
@@ -125,7 +124,7 @@ that already reconciles map-side states from different source partitions
 after a real shuffle.
 
 If a partition never crosses the threshold, this is byte-for-byte the
-pre-Milestone-9 behavior. If it does spill, the final, still-in-memory
+plain, non-spilling behavior. If it does spill, the final, still-in-memory
 remainder is *not* itself spilled (saving one round-trip); instead the
 returned `Partition`'s `records_fn` processes one of the 32 buckets at a
 time: seed a small dict from the remainder's keys that hash to that
@@ -147,8 +146,7 @@ imbalance (for the reduce-side shuffle partitioning generally, not this
 specific bucket mechanism, but the mechanism is the same underlying
 issue: `HashPartitioner` routes a whole key's data to one place, so a
 key holding an outsized share of rows becomes an outsized share of work
-somewhere); it is a measurement, explicitly, not a fix, per this
-milestone's own scope decision.
+somewhere); it is a measurement, explicitly, not a fix, by design.
 
 ### What spilling costs
 
@@ -183,8 +181,8 @@ The obstacle, found empirically before writing any implementation code:
 `csv.reader(f)` disables `f.tell()` for the rest of that file object's
 life (`OSError: telling position disabled by next() call`), so neither
 the offset-recording pass nor a partition's own read can iterate a
-`csv.reader` directly over the file the way the pre-Milestone-9 code did.
-`f.readline()` has no such restriction and round-trips correctly with
+`csv.reader` directly over the file the way an earlier, simpler version
+did. `f.readline()` has no such restriction and round-trips correctly with
 `f.seek()`, so both now parse one already-read line at a time via
 `next(csv.reader([line]))`. The accepted cost: a quoted CSV field
 containing a literal embedded newline is split across two `readline()`
@@ -204,8 +202,8 @@ No cost-based or adaptive threshold, `spill_threshold_bytes` is a fixed
 number a query either crosses or does not, not adjusted based on
 observed memory pressure or available system memory at runtime. No
 spilling for `HashJoinExec`'s build-side hash table (only `SortExec` and
-`HashAggregateExec` spill, per this milestone's own scoped decision).
-No sub-partitioning of an oversized grace-hash bucket (skew is measured,
+`HashAggregateExec` spill, by design). No sub-partitioning of an
+oversized grace-hash bucket (skew is measured,
 not mitigated, see above). No exact byte accounting, both operators'
 size estimates are the same `sys.getsizeof`-based heuristic already used
 elsewhere in this codebase, not a true measurement of process memory
