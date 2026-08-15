@@ -1,6 +1,6 @@
 # Execution Model
 
-How a physical plan becomes running tasks, as of Milestone 8. See
+How a physical plan becomes running tasks. See
 `docs/query-planning.md` for everything upstream of this (logical plan,
 analyzer, optimizer, physical plan) and `docs/shuffle.md` for what
 specifically happens at a shuffle boundary; this document covers the
@@ -27,7 +27,7 @@ Dataset (rows, merged back from the last stage's task results)
 `Dataset` (`core/dataset.py`) is an ordered collection of `Partition`s
 sharing one `Schema`. A `Partition` (`core/partition.py`) does not hold
 materialized rows; it holds a zero-argument `records_fn` that produces an
-iterator on demand. As of Milestone 3, `records_fn` must be picklable, not
+iterator on demand. `records_fn` must be picklable, not
 just callable: `MemoryDataSource`, `CSVDataSource`, and
 `Dataset.repartition()` all build it with `functools.partial(iter, rows)`
 or `functools.partial(some_module_level_function, ...)` rather than a
@@ -67,8 +67,8 @@ the plan and, at each `ExchangeExec`, rewrites it into a
 `build_stages()` splits each side independently; either, both, or
 neither may close off its own upstream stage(s) (a shuffle hash join
 closes both, a broadcast join only the broadcast side). A plan with no
-`ExchangeExec` still produces exactly one stage, unchanged from
-Milestone 3; a plan with one produces two (a `group_by`, or a broadcast
+`ExchangeExec` still produces exactly one stage; a plan with one
+produces two (a `group_by`, or a broadcast
 join); a plan with more (a shuffle hash join produces three: two writes,
 one join; `order_by` produces two: one write, one final sort; a query
 combining several of these produces more still), the splitting is not
@@ -97,7 +97,7 @@ anything that exists).
 | `output_records` | exact for a normal task; `0` for a shuffle-write task (its output is blocks, not rows, see `shuffle_bytes`) |
 | `output_bytes` | rough heuristic (`sys.getsizeof` summed over row values), not an on-disk byte count, same caveat as `optimizer/statistics.py`; `0` for a shuffle-write task |
 | `input_bytes` | not implemented (would need byte-offset tracking in the storage layer) |
-| `cpu_time_seconds`, `peak_memory_bytes` | Milestone 8: filled in by `execution/worker.py` via the optional `psutil` dependency, `None` if it is not installed; `peak_memory_bytes` is this worker process's RSS at task completion, not a true continuously-sampled peak (would need a concurrently running background thread, not implemented) |
+| `cpu_time_seconds`, `peak_memory_bytes` | Filled in by `execution/worker.py` via the optional `psutil` dependency, `None` if it is not installed; `peak_memory_bytes` is this worker process's RSS at task completion, not a true continuously-sampled peak (would need a concurrently running background thread, not implemented) |
 | `shuffle_bytes` | `0` for a task with no shuffle input or output; for a shuffle-write task, total bytes written across all target partitions; for a shuffle-read task, total bytes read for its one target partition |
 
 `TaskResult` carries `state` (a `TaskState`: `PENDING`/`RUNNING`/`SUCCESS`/
@@ -148,9 +148,8 @@ single-stage case. `local[N]` controls *how* each stage's tasks run:
   directly. No multiprocessing overhead, but the exact same `Task` ->
   `TaskResult` path as `N > 1`.
 - `N > 1`: tasks run across a real `concurrent.futures.ProcessPoolExecutor`
-  with `N` worker processes, real OS processes, not threads. The build
-  spec is explicit that threads are the wrong tool for CPU-bound work here
-  because of the GIL.
+  with `N` worker processes, real OS processes, not threads: threads are
+  the wrong tool for CPU-bound work in Python because of the GIL.
 
 Retries happen in the scheduler's own process, not inside a worker:
 because `execute_task` already turns a failure into a `FAILED`
@@ -160,10 +159,11 @@ came back from a direct call or from a pool worker. Failed tasks are
 retried individually (a failure on one partition does not force every
 other partition to retry) up to `engine.max_task_retries` (`Config`); a
 task that is still failing after that raises `TaskExecutionError` in the
-scheduler's process, naming the task and the last error. There is no
-lineage-based recomputation of a *lost* partition yet (Milestone 6); this
-retry only re-runs a task that reported failure while the process that ran
-it stayed alive.
+scheduler's process, naming the task and the last error. This retry only
+re-runs a task that reported failure while the process that ran it
+stayed alive; recomputing a partition whose *upstream* data has gone
+missing entirely is a separate mechanism, lineage-based recomputation,
+covered below.
 
 `_run_task` is an injectable constructor argument specifically so tests
 can exercise scheduling/retry/state-tracking logic with a fast, synchronous
@@ -175,7 +175,7 @@ observing a worker's OS process id
 
 ## Lineage-based recomputation
 
-Milestone 3's task retry (above) re-runs the *same* task in place, using
+Ordinary task retry (above) re-runs the *same* task in place, using
 the exact same shuffle blocks it was given the first time: correct for an
 ordinary, possibly-transient failure, but useless if the failure is that
 those blocks are no longer readable, retrying the same read just fails
@@ -227,14 +227,14 @@ failure domain to simulate: every shuffle block for a query already lives
 under one shared scratch directory on the one local machine (see
 `docs/shuffle.md`), not on a per-worker-process local disk the way a real
 multi-machine cluster's executors would have, so the realistic failure
-this milestone simulates is a lost or corrupted block *file*, not a lost
+this design simulates is a lost or corrupted block *file*, not a lost
 *machine*.
 
 ## Checkpointing
 
-`DataFrame.checkpoint()` (`api/dataframe.py`) is the other half of
-Milestone 6: it runs the current plan now (exactly like `collect()`) and
-writes the result to a durable, on-disk checkpoint directory
+`DataFrame.checkpoint()` (`api/dataframe.py`) runs the current plan now
+(exactly like `collect()`) and writes the result to a durable, on-disk
+checkpoint directory
 (`storage/checkpoint.py`), then returns a *new* `DataFrame` whose logical
 plan is a single, fresh `Scan` over that checkpoint. Everything that
 built the checkpointed data, every `Filter`/`Project`/`Join`/`Aggregate`/
@@ -256,11 +256,10 @@ is no checkpoint garbage collector.
 
 ## Metrics and profiling
 
-Per-task `TaskMetrics` existed since Milestone 3, but nothing aggregated
-them across a stage or a whole query, and no `DataFrame` action exposed
-them to a caller at all: a `TaskResult`'s `metrics` was read exactly
-once, for `output_records`, by `_results_to_dataset()`, then discarded.
-Milestone 8's `execution/metrics.py` adds `StageMetrics` (one per stage
+Per-task `TaskMetrics` exists on every `TaskResult`, but on its own it is
+not aggregated across a stage or a whole query, and nothing about a task
+running exposes it to a caller directly. `execution/metrics.py` adds
+`StageMetrics` (one per stage
 *run*, summed/maxed from that stage's tasks' `TaskMetrics`) and
 `QueryMetrics` (every `StageMetrics` from one `run_plan()` call, plus
 total wall-clock time). `LocalScheduler.run_plan()` builds one
@@ -280,7 +279,7 @@ measurable work, and folding them together would understate the total
 cost a fault actually imposed.
 
 Deliberately **not** threaded into `DataFrame.explain()`: `explain()`
-has never executed anything (Milestone 1's behavior, still true), and
+never executes anything, and
 conflating "show me the plan" with "run the query and show me what
 happened" would be an unwanted change to an already-stable, highly
 visible method's contract. Metrics describe what *happened*, only ever
