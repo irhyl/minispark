@@ -3,20 +3,17 @@
 What would have to change for MiniSpark's workers to run on separate
 machines instead of separate local processes, and what already would
 not. This is an analysis, not an implementation: nothing in this
-document adds networking, RPC, or any new configuration surface. The
-build spec is explicit that this milestone is "architecture readiness
-for remote workers, network communication, cloud deployment, not
-implemented until the local engine is stable," and its own
-non-negotiables forbid claiming distributed execution when the system
-is only multiprocessing. `EngineConfig.master` (`config/config.py`)
-still only parses `"local"` / `"local[N]"` and raises `ValueError` for
+document adds networking, RPC, or any new configuration surface, and
+this project forbids claiming distributed execution when the system is
+only multiprocessing. `EngineConfig.master` (`config/config.py`) still
+only parses `"local"` / `"local[N]"` and raises `ValueError` for
 anything else after reading this document; that has not changed.
 
 The project's stated goal is narrower than "add distributed execution
-later": "the same architecture should extend to multiple machines later
-without a rewrite" (`docs/build-spec.md`'s Objective). This document is
-the evidence for whether that goal is actually true today, checked
-against the real code, not asserted from the design alone.
+later": the same architecture should extend to multiple machines later
+without a rewrite. This document is the evidence for whether that goal
+is actually true today, checked against the real code, not asserted
+from the design alone.
 
 ## Already transport-agnostic
 
@@ -51,10 +48,9 @@ the sender and receiver share a process or a machine.
 **`execute_task` is already a plain, importable module-level function,
 not a method on a stateful object**, specifically so it stays picklable
 and callable from anywhere it gets sent (`execution/worker.py`'s own
-docstring already names this as "the seam the build spec asks for:
-design the worker API so it can later become a remote process"). A
-remote worker process, whatever transport delivers the `Task` to it,
-would still call this exact same function.
+docstring names this directly as the seam that lets the worker API later
+become a remote process). A remote worker process, whatever transport
+delivers the `Task` to it, would still call this exact same function.
 
 **`LocalScheduler` already dispatches tasks through one injectable seam,
 `run_task: RunTaskFn | None`** (`execution/scheduler.py`), defaulting to
@@ -163,7 +159,7 @@ still want a way to distinguish "recompute is worth attempting" from
 
 | Concern | Exists today | Would need to be added |
 |---|---|---|
-| Task wire format | `Task`/`TaskResult`, already picklable | A transport (gRPC/HTTP/sockets, per the build spec's Technology section) to move the same payload between machines instead of processes |
+| Task wire format | `Task`/`TaskResult`, already picklable | A transport (gRPC/HTTP/sockets are the allowed choices) to move the same payload between machines instead of processes |
 | Task dispatch | `run_task` seam, `ProcessPoolExecutor` inline | A dispatch interface with more than one implementation, satisfied by both the existing local path and a new remote one |
 | Shuffle data movement | Checksummed, self-describing block format | A fetch-over-network read path, keeping the same checksum verification, replacing direct local `open()` |
 | Worker addressing | Nothing | Worker identity, discovery, and routing: real new surface |
@@ -179,8 +175,8 @@ interface layer added speculatively ahead of a second, real consumer.
 `LocalScheduler` still only dispatches through `ProcessPoolExecutor` or
 sequentially in-process; nothing anywhere opens a socket or makes a
 network call. This document is the map of which parts of the existing
-design already satisfy the build spec's "extend without a rewrite" goal
-(a real, checked claim, not an aspiration) and which parts are genuinely
-unbuilt, so that whoever eventually builds the remote-worker milestone
-starts from an accurate accounting instead of rediscovering the same
-seams from scratch.
+design already satisfy the "extend without a rewrite" goal (a real,
+checked claim, not an aspiration) and which parts are genuinely unbuilt,
+so that whoever eventually builds remote-worker support starts from an
+accurate accounting instead of rediscovering the same seams from
+scratch.
